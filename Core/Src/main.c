@@ -69,23 +69,38 @@ int main(void)
 
 
   /* USER CODE BEGIN 1 */
-	RCC->AHB1ENR |= (1 << 0);     // GPIOA clock (from before)
-	RCC->APB1ENR |= (1 << 17);
+	RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
+	RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
+	RCC->APB1ENR |= (1 << 17);//AHB1 enable
+	RCC->APB1ENR |= (1 << 21);// I2C1EN
 	// USART2 clock (new)
-	GPIOA->MODER &= ~(3 << (2*2));
+	GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
 	GPIOA->MODER |= (2 << (2*2));
 	GPIOA->MODER &= ~(3 << (2*3));
 	GPIOA->MODER |= (2 << (2*3));
+	GPIOB->MODER &= (0xF << (6*2)); // resetting pins PB6 and PB& to 0
+	GPIOB->MODER &= (0xA << (6*2)); //setting PB^ and PB7 to AF mode (1010)
+
 
 	GPIOA->AFR[0] &= ~(0xF << (4*2));
 	GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
 	GPIOA->AFR[0] &= ~(0xF << (4*3));
 	GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
+	GPIOB->AFR[0] |= (4 << 24) | (4 << 28);  // PB6 = AF4 (4*6), PB7 = AF4 (4*7) (I2C)
 
 	USART2->BRR = (8 << 4) | 11; //Setting Baud Rate Register via conversion formula
 	USART2->CR1 |= (1<<13); //Activating the USART2
 	USART2->CR1 |= (1<<3); //Transmitter Enabled
 	USART2->CR1 |= (1<<2); //Receiver Enabled
+
+	GPIOB->OTYPER |= (1 << 6) | (1 << 7); //Setting pin 6 and 7 to open-drain
+	GPIOB->PUPDR &= -(0xF << 12); //Resetting pins
+	GPIOB->PUPDR |= (0X5 << 12); //Setting the pins to 01 and 01
+
+	I2C1->CR2 |= (16 << 0); //Telling the I2C the clock speed (16MHz)
+	I2C1->CCR |= (80 << 0); //Using the formula from the ref sheet to set clock to 100kHz
+	I2C1->TRISE = 17; //telling the I2C to wait 17 clock ticks before registering signal
+	I2C1->CR1 |= (1 << 0); //Enabling peripheral
 
 	void sendChar(char c) {
 		while (!(USART2->SR & (1<<7)));
