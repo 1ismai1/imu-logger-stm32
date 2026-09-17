@@ -57,6 +57,114 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void delay_ms(int ms) {
+for (int i=0; i < ms; i++) {
+  while (!(SysTick->CTRL & (1<<16)));
+}
+}
+void sendChar(char c) {
+	while (!(USART2->SR & (1<<7)));
+	USART2->DR = c;
+}
+void sendStr(char *str) {
+	while (*str) {
+		sendChar(*str);
+		str++;
+	}
+}
+
+#define MPU_ADDR 0x68
+
+void sendHex(uint8_t b) {
+	char hex[] ="0123456789ABCDEF";
+	sendChar(hex[b >> 4]);
+	sendChar(hex[b & 0x0F]);
+}
+
+void mpu_probe(void) {
+	uint32_t t;
+
+	sendStr("bus busy = ");
+	sendHex((I2C1->SR2 >> 1) & 1);      // BUSY flag: 1 means line stuck low
+	sendStr("\r\n");
+
+	I2C1->CR1 |= (1 << 8);              // START
+	t = 200000;
+	while (!(I2C1->SR1 & (1 << 0))) {
+		if (--t == 0) { sendStr("FAIL: no start condition\r\n"); return; }
+	}
+	sendStr("start ok\r\n");
+
+	I2C1->DR = (MPU_ADDR << 1) | 0;     // address + write
+	t = 200000;
+	while (!(I2C1->SR1 & (1 << 1))) {
+		if (I2C1->SR1 & (1 << 10)) {    // AF = acknowledge failure
+			sendStr("FAIL: NACK - nothing at 0x68\r\n");
+			I2C1->SR1 &= ~(1 << 10);
+			I2C1->CR1 |= (1 << 9);
+			return;
+		}
+		if (--t == 0) {
+			sendStr("FAIL: timeout waiting ADDR\r\n");
+			I2C1->CR1 |= (1 << 9);
+			return;
+		}
+	}
+	(void)I2C1->SR1;
+	(void)I2C1->SR2;
+	sendStr("addr ok - device answered\r\n");
+	I2C1->CR1 |= (1 << 9);              // STOP
+}
+
+void i2c_start(void) {
+	I2C1->CR1 |= (1<<8); //generate a start condition
+	while (!(I2C1->SR1 & (1 << 0))); //start condition was sent
+
+}
+
+void i2c_addr(uint8_t addr,uint8_t read) {
+	I2C1->DR = (addr << 1) | read;
+	while (!(I2C1->SR1 & (1 << 1))); //slave acknowledged its address
+	(void)I2C1->SR1;
+	(void)I2C1->SR2;
+
+}
+
+void i2c_write(uint8_t data) {
+	while (!(I2C1->SR1 & (1<<7)));
+	I2C1->DR = data;
+	while (!(I2C1->SR1 & (1 << 2)));
+}
+
+void i2c_stop(void) {
+	I2C1->CR1 |= (1<<9);
+}
+
+uint8_t mpu_read_reg(uint8_t reg) {
+	uint8_t val;
+	// tell the MPU which register we want
+		i2c_start();
+		i2c_addr(MPU_ADDR, 0);              //set to bit 0 = write
+		i2c_write(reg);
+
+		// repeated START, switch direction to read
+		i2c_start();
+		I2C1->CR1 &= ~(1 << 10);            // ACK off: we want exactly one byte
+		I2C1->DR = (MPU_ADDR << 1) | 1;     // address and read
+		while (!(I2C1->SR1 & (1 << 1)));    // wait ADDR
+		(void)I2C1->SR1;
+		(void)I2C1->SR2;                    // clear ADDR
+		I2C1->CR1 |= (1 << 9);              // STOP queued right away
+
+		while (!(I2C1->SR1 & (1 << 6)));    // wait RXNE
+		val = I2C1->DR;
+
+		I2C1->CR1 |= (1 << 10);             // ACK back on for later burst reads
+		return val;
+}
+
+
+
 
 /* USER CODE END 0 */
 
@@ -64,56 +172,13 @@ static void MX_USART2_UART_Init(void);
   * @brief  The application entry point.
   * @retval int
   */
+
 int main(void)
 {
 
 
   /* USER CODE BEGIN 1 */
-	RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
-	RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
-	RCC->APB1ENR |= (1 << 17);//AHB1 enable
-	RCC->APB1ENR |= (1 << 21);// I2C1EN
-	// USART2 clock (new)
-	GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
-	GPIOA->MODER |= (2 << (2*2));
-	GPIOA->MODER &= ~(3 << (2*3));
-	GPIOA->MODER |= (2 << (2*3));
-	GPIOB->MODER &= (0xF << (6*2)); // resetting pins PB6 and PB& to 0
-	GPIOB->MODER &= (0xA << (6*2)); //setting PB^ and PB7 to AF mode (1010)
 
-
-	GPIOA->AFR[0] &= ~(0xF << (4*2));
-	GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
-	GPIOA->AFR[0] &= ~(0xF << (4*3));
-	GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
-	GPIOB->AFR[0] |= (4 << 24) | (4 << 28);  // PB6 = AF4 (4*6), PB7 = AF4 (4*7) (I2C)
-
-	USART2->BRR = (8 << 4) | 11; //Setting Baud Rate Register via conversion formula
-	USART2->CR1 |= (1<<13); //Activating the USART2
-	USART2->CR1 |= (1<<3); //Transmitter Enabled
-	USART2->CR1 |= (1<<2); //Receiver Enabled
-
-	GPIOB->OTYPER |= (1 << 6) | (1 << 7); //Setting pin 6 and 7 to open-drain
-	GPIOB->PUPDR &= -(0xF << 12); //Resetting pins
-	GPIOB->PUPDR |= (0X5 << 12); //Setting the pins to 01 and 01
-
-	I2C1->CR2 |= (16 << 0); //Telling the I2C the clock speed (16MHz)
-	I2C1->CCR |= (80 << 0); //Using the formula from the ref sheet to set clock to 100kHz
-	I2C1->TRISE = 17; //telling the I2C to wait 17 clock ticks before registering signal
-	I2C1->CR1 |= (1 << 0); //Enabling peripheral
-
-	void sendChar(char c) {
-		while (!(USART2->SR & (1<<7)));
-		USART2->DR = c;
-	}
-	void sendStr(char *str) {
-		while (*str) {
-			sendChar(*str);
-			str++;
-		}
-
-	}
-	sendStr("hello world\r\n");
 	/* USER CODE END 1 */
 
 
@@ -137,15 +202,48 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  SysTick->LOAD = 16000 - 1; //start count down from 1ms because 16MHz
+  RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
+  RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
+  RCC->APB1ENR |= (1 << 17);//AHB1 enable
+  RCC->APB1ENR |= (1 << 21);// I2C1EN
+  	// USART2 clock (new)
+  GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
+  GPIOA->MODER |= (2 << (2*2));
+  GPIOA->MODER &= ~(3 << (2*3));
+  GPIOA->MODER |= (2 << (2*3));
+  GPIOB->MODER &= ~(0xF << (6*2)); // resetting pins PB6 and PB& to 0
+  GPIOB->MODER |= (0xA << (6*2)); //setting PB^ and PB7 to AF mode (1010)
+
+
+  GPIOA->AFR[0] &= ~(0xF << (4*2));
+  GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
+  GPIOA->AFR[0] &= ~(0xF << (4*3));
+  GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
+  GPIOB->AFR[0] |= (4 << 24) | (4 << 28);  // PB6 = AF4 (4*6), PB7 = AF4 (4*7) (I2C)
+
+  USART2->BRR = (22 << 4) | 13; //Setting Baud Rate Register via conversion formula
+  USART2->CR1 |= (1<<13); //Activating the USART2
+  USART2->CR1 |= (1<<3); //Transmitter Enabled
+  USART2->CR1 |= (1<<2); //Receiver Enabled
+
+  GPIOB->OTYPER |= (1 << 6) | (1 << 7); //Setting pin 6 and 7 to open-drain
+  GPIOB->PUPDR &= ~(0xF << 12); //Resetting pins
+  GPIOB->PUPDR |= (0X5 << 12); //Setting the pins to 01 and 01
+
+  I2C1->CR1 |= (1 << 15);    // SOFTWARE RESET or SWRST
+  I2C1->CR1 &= ~(1 << 15);
+  I2C1->CR2 |= (42 << 0); //Telling the I2C the clock speed (16MHz)
+  I2C1->CCR |= (210 << 0); //Using the formula from the ref sheet to set clock to 100kHz
+  I2C1->TRISE = 43; //telling the I2C to wait 17 clock ticks before registering signal
+  I2C1->CR1 |= (1 << 0); //Enabling peripheral
+
+
+  SysTick->LOAD = 84000 - 1; //start count down from 1ms because 16MHz
   SysTick->VAL = 0; //resets count down to 0
   SysTick->CTRL = (1<<2) | (1<<0); //flips to on (on/off switch) and activates clock source
-  void delay_ms(int ms) {
-	  for (int i=0; i < ms; i++) {
-		  while (!(SysTick->CTRL & (1<<16)));
-	  }
 
-  }
+  sendStr("hello world\r\n");
+  mpu_probe();
   /* USER CODE END 2 */
 
   /* Infinite loop */
