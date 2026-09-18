@@ -73,7 +73,10 @@ void sendStr(char *str) {
 	}
 }
 
-#define MPU_ADDR 0x68
+#define MPU_ADDR  0x68      // 7-bit address
+#define WHO_AM_I  0x75
+#define PWR_MGMT_1  0x6B
+#define ACCEL_XOUT_H 0x3B
 
 void sendHex(uint8_t b) {
 	char hex[] ="0123456789ABCDEF";
@@ -100,7 +103,7 @@ void mpu_probe(void) {
 	while (!(I2C1->SR1 & (1 << 1))) {
 		if (I2C1->SR1 & (1 << 10)) {    // AF = acknowledge failure
 			sendStr("FAIL: NACK - nothing at 0x68\r\n");
-			I2C1->SR1 &= ~(1 << 10);
+			I2C1->SR1 = ~(1 << 10);
 			I2C1->CR1 |= (1 << 9);
 			return;
 		}
@@ -122,12 +125,26 @@ void i2c_start(void) {
 
 }
 
-void i2c_addr(uint8_t addr,uint8_t read) {
-	I2C1->DR = (addr << 1) | read;
-	while (!(I2C1->SR1 & (1 << 1))); //slave acknowledged its address
-	(void)I2C1->SR1;
-	(void)I2C1->SR2;
+uint8_t i2c_addr(uint8_t addr, uint8_t read) {
+    uint32_t t = 200000;
 
+    I2C1->DR = (addr << 1) | read;
+
+    while (!(I2C1->SR1 & (1 << 1))) {       // wait for ADDR
+        if (I2C1->SR1 & (1 << 10)) {        // AF = nobody answered
+            I2C1->SR1 = ~(1 << 10);         // clear AF
+            I2C1->CR1 |= (1 << 9);          // STOP, release the bus
+            return 0;
+        }
+        if (--t == 0) {
+            I2C1->CR1 |= (1 << 9);          // STOP
+            return 0;
+        }
+    }
+
+    (void)I2C1->SR1;
+    (void)I2C1->SR2;                        // clear ADDR
+    return 1;
 }
 
 void i2c_write(uint8_t data) {
@@ -141,29 +158,38 @@ void i2c_stop(void) {
 }
 
 uint8_t mpu_read_reg(uint8_t reg) {
-	uint8_t val;
-	// tell the MPU which register we want
-		i2c_start();
-		i2c_addr(MPU_ADDR, 0);              //set to bit 0 = write
-		i2c_write(reg);
+    uint8_t val;
 
-		// repeated START, switch direction to read
-		i2c_start();
-		I2C1->CR1 &= ~(1 << 10);            // ACK off: we want exactly one byte
-		I2C1->DR = (MPU_ADDR << 1) | 1;     // address and read
-		while (!(I2C1->SR1 & (1 << 1)));    // wait ADDR
-		(void)I2C1->SR1;
-		(void)I2C1->SR2;                    // clear ADDR
-		I2C1->CR1 |= (1 << 9);              // STOP queued right away
+    i2c_start();
+    if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: write addr\r\n"); return 0xFF; }
+    i2c_write(reg);
 
-		while (!(I2C1->SR1 & (1 << 6)));    // wait RXNE
-		val = I2C1->DR;
+    i2c_start();
+    I2C1->CR1 &= ~(1 << 10);            // ACK off before clearing ADDR
+    I2C1->DR = (MPU_ADDR << 1) | 1;
+    while (!(I2C1->SR1 & (1 << 1)));    // ADDR
+    (void)I2C1->SR1;
+    (void)I2C1->SR2;
+    I2C1->CR1 |= (1 << 9);              // STOP
 
-		I2C1->CR1 |= (1 << 10);             // ACK back on for later burst reads
-		return val;
+    while (!(I2C1->SR1 & (1 << 6)));    // RXNE
+    val = I2C1->DR;
+
+    I2C1->CR1 |= (1 << 10);
+    return val;
 }
 
+void mpu_write_reg(uint8_t reg, uint8_t val) {
+	i2c_start();
+	if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: write addr\r\n"); return; } //check if chip answers with a write request
+	i2c_write(reg);
+	i2c_write(val);
+	i2c_stop;
 
+
+
+
+}
 
 
 /* USER CODE END 0 */
@@ -204,46 +230,55 @@ int main(void)
   /* USER CODE BEGIN 2 */
   RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
   RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
-  RCC->APB1ENR |= (1 << 17);//AHB1 enable
+  RCC->APB1ENR |= (1 << 17);//USARTEN enable
   RCC->APB1ENR |= (1 << 21);// I2C1EN
   	// USART2 clock (new)
   GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
   GPIOA->MODER |= (2 << (2*2));
   GPIOA->MODER &= ~(3 << (2*3));
   GPIOA->MODER |= (2 << (2*3));
-  GPIOB->MODER &= ~(0xF << (6*2)); // resetting pins PB6 and PB& to 0
-  GPIOB->MODER |= (0xA << (6*2)); //setting PB^ and PB7 to AF mode (1010)
+  GPIOB->MODER &= ~(0xF << (8*2)); // resetting pins PB6 and PB7 to 0
+  GPIOB->MODER |= (0xA << (8*2)); //setting PB6 and PB7 to AF mode (1010)
 
 
   GPIOA->AFR[0] &= ~(0xF << (4*2));
   GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
   GPIOA->AFR[0] &= ~(0xF << (4*3));
   GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
-  GPIOB->AFR[0] |= (4 << 24) | (4 << 28);  // PB6 = AF4 (4*6), PB7 = AF4 (4*7) (I2C)
+  GPIOB->AFR[1] &= ~((0xF << 0) | (0xF << 4));
+  GPIOB->AFR[1] |= (4 << 0) | (4 << 4);  // PB8 = AF4 (4*0), PB9 = AF4 (4*1) (I2C)
 
   USART2->BRR = (22 << 4) | 13; //Setting Baud Rate Register via conversion formula
   USART2->CR1 |= (1<<13); //Activating the USART2
   USART2->CR1 |= (1<<3); //Transmitter Enabled
   USART2->CR1 |= (1<<2); //Receiver Enabled
 
-  GPIOB->OTYPER |= (1 << 6) | (1 << 7); //Setting pin 6 and 7 to open-drain
-  GPIOB->PUPDR &= ~(0xF << 12); //Resetting pins
-  GPIOB->PUPDR |= (0X5 << 12); //Setting the pins to 01 and 01
+  GPIOB->OTYPER |= (1 << 8) | (1 << 9); //Setting pin 8 and 9 to open-drain
+  GPIOB->PUPDR &= ~(0xF << 16); //Resetting pins
+  GPIOB->PUPDR |= (0X5 << 16); //Setting the pins to 01 and 01
 
   I2C1->CR1 |= (1 << 15);    // SOFTWARE RESET or SWRST
   I2C1->CR1 &= ~(1 << 15);
-  I2C1->CR2 |= (42 << 0); //Telling the I2C the clock speed (16MHz)
+  I2C1->CR2 |= (42 << 0); //Telling the I2C the clock speed (42MHz apb1)
   I2C1->CCR |= (210 << 0); //Using the formula from the ref sheet to set clock to 100kHz
-  I2C1->TRISE = 43; //telling the I2C to wait 17 clock ticks before registering signal
+  I2C1->TRISE = 43; //telling the I2C to wait 43 clock ticks before registering signal
   I2C1->CR1 |= (1 << 0); //Enabling peripheral
 
 
-  SysTick->LOAD = 84000 - 1; //start count down from 1ms because 16MHz
+  SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
   SysTick->CTRL = (1<<2) | (1<<0); //flips to on (on/off switch) and activates clock source
 
-  sendStr("hello world\r\n");
-  mpu_probe();
+  delay_ms(100);              // MPU boot time
+  mpu_probe();                // does anything answer at 0x68?
+
+  mpu_write_reg(PWR_MGMT_1, 0x01);   // wake up
+  delay_ms(100);
+
+  // confirm it actually woke
+  sendStr("PWR = 0x");
+  sendHex(mpu_read_reg(PWR_MGMT_1));
+  sendStr("\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -251,7 +286,16 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
+	uint8_t hi = mpu_read_reg(ACCEL_XOUT_H);
+	uint8_t lo = mpu_read_reg(ACCEL_XOUT_H+1);
+	int16_t ax = (int16_t)(hi << 8) | lo;
 
+	sendStr("AX = ");
+	sendHex((ax >> 8) & 0xFF);
+	sendHex(ax & 0xFF);
+	sendStr("\r\n");
+
+	delay_ms(200);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
