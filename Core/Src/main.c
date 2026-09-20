@@ -184,14 +184,47 @@ void mpu_write_reg(uint8_t reg, uint8_t val) {
 	if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: write addr\r\n"); return; } //check if chip answers with a write request
 	i2c_write(reg);
 	i2c_write(val);
-	i2c_stop;
+	i2c_stop();
+}
 
+void mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
+	i2c_start();
+	if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: burst wr\r\n"); return; }
+	i2c_write(reg);
 
+	I2C1->CR1 |= (1 << 10);
+	i2c_start();
+	if (!i2c_addr(MPU_ADDR, 1)) { sendStr("NACK: burst rd\r\n"); return; }
 
+	while (n > 3) {
+		while (!(I2C1->SR1 & (1 << 6)));
+		*buf++ = I2C1->DR;
+		n--;
+	}
+
+	while (!(I2C1->SR1 & (1<<2)));
+		I2C1->CR1 &= ~(1 << 10);
+		*buf++ = I2C1->DR;
+		I2C1->CR1 |= (1 << 9);
+		*buf++ = I2C1->DR;
+		while(!(I2C1->SR1 & (1 << 6)));
+		*buf++ = I2C1->DR;
+
+		I2C1->CR1 |= (1 << 10);
 
 }
 
+void sendInt(int16_t v) {
+	char buf[7];
+	int i = 6;
+	uint16_t u;
 
+	if (v < 0) { sendStr("-"); u = -(int32_t)v; } else u = v;
+
+	buf[i] = '\0';
+	do { buf[--i] = '0' + (u % 10); u /= 10; } while (u);
+	sendStr(&buf[i]);
+}
 /* USER CODE END 0 */
 
 /**
@@ -237,8 +270,8 @@ int main(void)
   GPIOA->MODER |= (2 << (2*2));
   GPIOA->MODER &= ~(3 << (2*3));
   GPIOA->MODER |= (2 << (2*3));
-  GPIOB->MODER &= ~(0xF << (8*2)); // resetting pins PB6 and PB7 to 0
-  GPIOB->MODER |= (0xA << (8*2)); //setting PB6 and PB7 to AF mode (1010)
+  GPIOB->MODER &= ~(0xF << (8*2)); // resetting pins PB8 and PB9 to 0
+  GPIOB->MODER |= (0xA << (8*2)); //setting PB8 and PB9 to AF mode (1010)
 
 
   GPIOA->AFR[0] &= ~(0xF << (4*2));
@@ -279,23 +312,28 @@ int main(void)
   sendStr("PWR = 0x");
   sendHex(mpu_read_reg(PWR_MGMT_1));
   sendStr("\r\n");
+
+  uint8_t raw[14];
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* USER CODE END WHILE */
-	uint8_t hi = mpu_read_reg(ACCEL_XOUT_H);
-	uint8_t lo = mpu_read_reg(ACCEL_XOUT_H+1);
-	int16_t ax = (int16_t)(hi << 8) | lo;
+		mpu_read_burst(ACCEL_XOUT_H, raw, 14);
 
-	sendStr("AX = ");
-	sendHex((ax >> 8) & 0xFF);
-	sendHex(ax & 0xFF);
-	sendStr("\r\n");
+		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
+		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
+		int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
+		int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
+		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
+		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-	delay_ms(200);
+		sendStr("A "); sendInt(ax); sendStr(" "); sendInt(ay); sendStr(" "); sendInt(az);
+		sendStr("  G "); sendInt(gx); sendStr(" "); sendInt(gy); sendStr(" "); sendInt(gz);
+		sendStr("\r\n");
+
+		delay_ms(100);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
