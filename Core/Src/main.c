@@ -73,10 +73,44 @@ void sendStr(char *str) {
 	}
 }
 
+void sendInt(int16_t v) {
+	char buf[7];
+	int i = 6;
+	uint16_t u;
+
+	if (v < 0) { sendStr("-"); u = -(int32_t)v; } else u = v;
+
+	buf[i] = '\0';
+	do { buf[--i] = '0' + (u % 10); u /= 10; } while (u);
+	sendStr(&buf[i]);
+}
+
+void sendFloat(float v) {
+	uint16_t m;
+	float u;
+	float d;
+
+	if (v < 0) { sendStr("-"); u = -(float)v; } else u = v;
+
+
+	m = u;
+	d = (u - m)*100;
+
+	sendInt(m);
+	sendStr(".");
+	if (d < 10) {
+			sendStr("0");
+		}
+	sendInt(d);
+}
+
+
 #define MPU_ADDR  0x68      // 7-bit address
 #define WHO_AM_I  0x75
 #define PWR_MGMT_1  0x6B
 #define ACCEL_XOUT_H 0x3B
+#define GYRO_CONFIG 0x1B
+#define ACCEL_CONFIG 0x1C
 
 void sendHex(uint8_t b) {
 	char hex[] ="0123456789ABCDEF";
@@ -214,17 +248,7 @@ void mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
 
 }
 
-void sendInt(int16_t v) {
-	char buf[7];
-	int i = 6;
-	uint16_t u;
 
-	if (v < 0) { sendStr("-"); u = -(int32_t)v; } else u = v;
-
-	buf[i] = '\0';
-	do { buf[--i] = '0' + (u % 10); u /= 10; } while (u);
-	sendStr(&buf[i]);
-}
 /* USER CODE END 0 */
 
 /**
@@ -306,6 +330,8 @@ int main(void)
   mpu_probe();                // does anything answer at 0x68?
 
   mpu_write_reg(PWR_MGMT_1, 0x01);   // wake up
+  mpu_write_reg(ACCEL_CONFIG, 0x08);
+  mpu_write_reg(GYRO_CONFIG, 0x08);
   delay_ms(100);
 
   // confirm it actually woke
@@ -329,8 +355,25 @@ int main(void)
 		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
 		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-		sendStr("A "); sendInt(ax); sendStr(" "); sendInt(ay); sendStr(" "); sendInt(az);
-		sendStr("  G "); sendInt(gx); sendStr(" "); sendInt(gy); sendStr(" "); sendInt(gz);
+		//subtracting gyroscope biases
+		gx -= -404;
+		gy -= -206;
+		gz -= -5;
+
+		float ax_g = ax/8192.0f;
+		float ay_g = ay/8192.0f;
+		float az_g = az/8192.0f;
+
+		ax_g -= 0.095f;
+		ay_g += 0.025f;
+		az_g += 0.22f;
+
+		float gx_dps = gx/65.5f;
+		float gy_dps = gy/65.5f;
+		float gz_dps = gz/65.5f;
+
+		sendStr("A "); sendFloat(ax_g); sendStr(" "); sendFloat(ay_g); sendStr(" "); sendFloat(az_g);
+		sendStr("  G "); sendFloat(gx_dps); sendStr(" "); sendFloat(gy_dps); sendStr(" "); sendFloat(gz_dps);
 		sendStr("\r\n");
 
 		delay_ms(100);
