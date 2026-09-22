@@ -18,7 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-
+#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -340,6 +340,9 @@ int main(void)
   sendStr("\r\n");
 
   uint8_t raw[14];
+  float gyro_angle = 0;
+  float angle = 0;
+  uint8_t counter = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -355,6 +358,7 @@ int main(void)
 		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
 		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
+
 		//subtracting gyroscope biases
 		gx -= -404;
 		gy -= -206;
@@ -368,15 +372,35 @@ int main(void)
 		ay_g += 0.025f;
 		az_g += 0.22f;
 
+		float acc_angle = atan2f(ay_g,az_g)*57.2958f;
+
 		float gx_dps = gx/65.5f;
 		float gy_dps = gy/65.5f;
 		float gz_dps = gz/65.5f;
 
+		gyro_angle += gx_dps*0.01f;
+
+		float error = acc_angle - angle;
+		if (error > 180) {
+			error -= 360;
+		}
+		else if (error < -180) {
+			error += 360;
+		}
+
+		angle = (angle + gx_dps*0.01) + 0.02*error;
+		float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
+
+		if (counter%10 == 0) {
 		sendStr("A "); sendFloat(ax_g); sendStr(" "); sendFloat(ay_g); sendStr(" "); sendFloat(az_g);
 		sendStr("  G "); sendFloat(gx_dps); sendStr(" "); sendFloat(gy_dps); sendStr(" "); sendFloat(gz_dps);
+		sendStr(" A "); sendFloat(angle);
+		sendStr(" P "); sendFloat(pitch);
 		sendStr("\r\n");
-
-		delay_ms(100);
+		counter = 0;
+		}
+		counter+=1;
+		delay_ms(10);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
