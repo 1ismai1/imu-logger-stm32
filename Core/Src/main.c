@@ -329,6 +329,34 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 	spi_transfer(0xFF);
 	return 0;
 }
+
+uint8_t sd_write_block(uint32_t block, uint8_t *buf)
+{
+	uint8_t r = sd_send_cmd(24, block, 0x01);
+	if (r != 0) {sd_deselect(); return 1; }
+
+	spi_transfer(0xFF);
+	spi_transfer(0xFE);
+
+	for (int i = 0; i < 512; i++) spi_transfer(buf[i]); // the data being sent
+
+	spi_transfer(0xFF);
+	spi_transfer(0xFF);
+	for (int k = 0; k < 10; k++) {
+	    r = spi_transfer(0xFF);
+	    if (r != 0xFF) break;
+	}
+	sd_last_resp = r;
+	if ((r & 0x1F) != 0x05) { sd_deselect(); return 2; }
+
+	uint32_t wait = 0;
+	while(spi_transfer(0xFF) == 0) {
+		if (++wait > 500000) { sd_deselect(); return 3; }
+	}
+
+	sd_deselect();
+	return 0;
+}
 /* ---------------- MPU-6050 ---------------- */
 
 #define MPU_ADDR  0x68      // 7-bit address
@@ -505,11 +533,26 @@ int main(void)
   sendInt(sd_buf[510]); sendStr(" ");
   sendInt(sd_buf[511]); sendStr("\r\n");
 
+  for (int i = 0; i < 512; i++) sd_buf[i] = (uint8_t)i;
+
+  uint8_t wr = sd_write_block(1000, sd_buf);
+
+  // Wipe the buffer so we know the data really came from the card
+  for (int i = 0; i < 512; i++) sd_buf[i] = 0;
+
+  uint8_t rd2 = sd_read_block(1000, sd_buf);
+
+  // Check every byte matches the pattern
+  int bad = 0;
   for (int i = 0; i < 512; i++) {
-      sendHex(sd_buf[i]);
-      sendStr(" ");
-      if (i % 16 == 15) sendStr("\r\n");
+      if (sd_buf[i] != (uint8_t)i) bad++;
   }
+
+  sendStr("write = ");  sendInt(wr);
+  sendStr("  read = "); sendInt(rd2);
+  sendStr("  bad bytes = "); sendInt(bad);
+  sendStr("\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
