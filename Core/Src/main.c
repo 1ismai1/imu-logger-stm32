@@ -62,6 +62,27 @@ for (int i=0; i < ms; i++) {
   while (!(SysTick->CTRL & (1<<16)));
 }
 }
+
+/* ---------------- UART2 ---------------- */
+void uart2_init(void) {
+  RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
+  RCC->APB1ENR |= (1 << 17);//USARTEN enable
+  	// USART2 clock (new)
+  GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
+  GPIOA->MODER |= (2 << (2*2));
+  GPIOA->MODER &= ~(3 << (2*3));
+  GPIOA->MODER |= (2 << (2*3));
+  GPIOA->AFR[0] &= ~(0xF << (4*2));
+  GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
+  GPIOA->AFR[0] &= ~(0xF << (4*3));
+  GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
+
+  USART2->BRR = (22 << 4) | 13; //Setting Baud Rate Register via conversion formula
+  USART2->CR1 |= (1<<13); //Activating the USART2
+  USART2->CR1 |= (1<<3); //Transmitter Enabled
+  USART2->CR1 |= (1<<2); //Receiver Enabled
+}
+
 void sendChar(char c) {
 	while (!(USART2->SR & (1<<7)));
 	USART2->DR = c;
@@ -104,53 +125,32 @@ void sendFloat(float v) {
 	sendInt(d);
 }
 
-
-#define MPU_ADDR  0x68      // 7-bit address
-#define WHO_AM_I  0x75
-#define PWR_MGMT_1  0x6B
-#define ACCEL_XOUT_H 0x3B
-#define GYRO_CONFIG 0x1B
-#define ACCEL_CONFIG 0x1C
-
 void sendHex(uint8_t b) {
 	char hex[] ="0123456789ABCDEF";
 	sendChar(hex[b >> 4]);
 	sendChar(hex[b & 0x0F]);
 }
 
-void mpu_probe(void) {
-	uint32_t t;
+/* ---------------- I2C1 ---------------- */
+void i2c1_init(void) {
+  RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
+  RCC->APB1ENR |= (1 << 21);// I2C1EN
+  GPIOB->MODER &= ~(0xF << (8*2)); // resetting pins PB8 and PB9 to 0
+  GPIOB->MODER |= (0xA << (8*2)); //setting PB8 and PB9 to AF mode (1010)
 
-	sendStr("bus busy = ");
-	sendHex((I2C1->SR2 >> 1) & 1);      // BUSY flag: 1 means line stuck low
-	sendStr("\r\n");
+  GPIOB->AFR[1] &= ~((0xF << 0) | (0xF << 4));
+  GPIOB->AFR[1] |= (4 << 0) | (4 << 4);  // PB8 = AF4 (4*0), PB9 = AF4 (4*1) (I2C)
 
-	I2C1->CR1 |= (1 << 8);              // START
-	t = 200000;
-	while (!(I2C1->SR1 & (1 << 0))) {
-		if (--t == 0) { sendStr("FAIL: no start condition\r\n"); return; }
-	}
-	sendStr("start ok\r\n");
+  GPIOB->OTYPER |= (1 << 8) | (1 << 9); //Setting pin 8 and 9 to open-drain
+  GPIOB->PUPDR &= ~(0xF << 16); //Resetting pins
+  GPIOB->PUPDR |= (0X5 << 16); //Setting the pins to 01 and 01
 
-	I2C1->DR = (MPU_ADDR << 1) | 0;     // address + write
-	t = 200000;
-	while (!(I2C1->SR1 & (1 << 1))) {
-		if (I2C1->SR1 & (1 << 10)) {    // AF = acknowledge failure
-			sendStr("FAIL: NACK - nothing at 0x68\r\n");
-			I2C1->SR1 = ~(1 << 10);
-			I2C1->CR1 |= (1 << 9);
-			return;
-		}
-		if (--t == 0) {
-			sendStr("FAIL: timeout waiting ADDR\r\n");
-			I2C1->CR1 |= (1 << 9);
-			return;
-		}
-	}
-	(void)I2C1->SR1;
-	(void)I2C1->SR2;
-	sendStr("addr ok - device answered\r\n");
-	I2C1->CR1 |= (1 << 9);              // STOP
+  I2C1->CR1 |= (1 << 15);    // SOFTWARE RESET or SWRST
+  I2C1->CR1 &= ~(1 << 15);
+  I2C1->CR2 |= (42 << 0); //Telling the I2C the clock speed (42MHz apb1)
+  I2C1->CCR |= (210 << 0); //Using the formula from the ref sheet to set clock to 100kHz
+  I2C1->TRISE = 43; //telling the I2C to wait 43 clock ticks before registering signal
+  I2C1->CR1 |= (1 << 0); //Enabling peripheral
 }
 
 void i2c_start(void) {
@@ -189,6 +189,126 @@ void i2c_write(uint8_t data) {
 
 void i2c_stop(void) {
 	I2C1->CR1 |= (1<<9);
+}
+
+/* ---------------- SPI1 ---------------- */
+void spi1_init(void) {
+  RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
+  RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
+  RCC->APB2ENR |= (1 << 12); //SPI1
+  GPIOA->MODER &= ~((3 << 10 ) | (3 << 12) | (3 << 14));
+  GPIOA->MODER |= ((2 << 10) | (2 << 12) | (2 << 14)); // RESETTING AND ENABLING AF FOR SPI
+
+  GPIOA->AFR[0] &= ~((0xF << 20) | (0xF << 24) | (0xF << 28)); // RESETTING AND ASSIGNING AF5
+  GPIOA->AFR[0] |= ((5 << 20) | (5 << 24) | (5 << 28));
+  GPIOA->OSPEEDR |= (3 <<10) | (3 << 12) | (3 << 14); //fast pins
+
+  GPIOB->MODER &= ~(3 << 12); //setting PB6 to be CS pin
+  GPIOB->MODER |= (1 << 12); // set output
+  GPIOB->BSRR = (1 << 6); //setting pin HIGH (basically setting it idle)
+
+  GPIOA->PUPDR &= ~(3 << 12);
+  GPIOA->PUPDR |= (3 << 12);
+
+  SPI1->CR1 = (1 << 2) //MSTR:  stm32 is master
+  	  	  	| (7 << 3) //BR: 84MHz / 256 = 328kHz (Sd cards need less than 400kHz)
+			| (1 << 9) //SSM: handling CS in software
+			| (1 << 8);//SSI: needed with SSM or SPI will shut off
+  SPI1->CR1 |= (1 << 6); //SPE: turn SPI on
+
+
+}
+
+uint8_t spi_transfer(uint8_t b)
+{
+	while (!(SPI1->SR & (1 << 1))); //Waiting to send byte
+	SPI1->DR = b;
+	while(!(SPI1->SR & (1 << 0))); // waiting to receive bite
+	return SPI1->DR; // read data
+}
+
+/* ---------------- SD card reader ---------------- */
+void sd_select(void)
+{
+    GPIOB->BSRR = (1 << 22);   // CS LOW
+}
+
+void sd_deselect(void)
+{
+    GPIOB->BSRR = (1 << 6);    // CS HIGH
+    spi_transfer(0xFF);        // extra byte so the card lets go of MISO
+}
+
+void sd_power_up(void)
+{
+    GPIOB->BSRR = (1 << 6);    // CS HIGH
+    for (int i = 0; i < 10; i++) spi_transfer(0xFF);   // 80 clocks
+}
+
+uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+    uint8_t r = 0xFF;
+
+    sd_select();
+
+    spi_transfer(0x40 | cmd);   // command byte
+    spi_transfer(arg >> 24);    // argument, top byte first
+    spi_transfer(arg >> 16);
+    spi_transfer(arg >> 8);
+    spi_transfer(arg);          // bottom byte
+    spi_transfer(crc);
+
+    for (int i = 0; i < 10; i++) {
+        r = spi_transfer(0xFF);
+        if (r != 0xFF) break;
+    }
+
+    return r;   // CS stays LOW on purpose (see below)
+}
+
+
+/* ---------------- MPU-6050 ---------------- */
+
+#define MPU_ADDR  0x68      // 7-bit address
+#define WHO_AM_I  0x75
+#define PWR_MGMT_1  0x6B
+#define ACCEL_XOUT_H 0x3B
+#define GYRO_CONFIG 0x1B
+#define ACCEL_CONFIG 0x1C
+
+void mpu_probe(void) {
+	uint32_t t;
+
+	sendStr("bus busy = ");
+	sendHex((I2C1->SR2 >> 1) & 1);      // BUSY flag: 1 means line stuck low
+	sendStr("\r\n");
+
+	I2C1->CR1 |= (1 << 8);              // START
+	t = 200000;
+	while (!(I2C1->SR1 & (1 << 0))) {
+		if (--t == 0) { sendStr("FAIL: no start condition\r\n"); return; }
+	}
+	sendStr("start ok\r\n");
+
+	I2C1->DR = (MPU_ADDR << 1) | 0;     // address + write
+	t = 200000;
+	while (!(I2C1->SR1 & (1 << 1))) {
+		if (I2C1->SR1 & (1 << 10)) {    // AF = acknowledge failure
+			sendStr("FAIL: NACK - nothing at 0x68\r\n");
+			I2C1->SR1 = ~(1 << 10);
+			I2C1->CR1 |= (1 << 9);
+			return;
+		}
+		if (--t == 0) {
+			sendStr("FAIL: timeout waiting ADDR\r\n");
+			I2C1->CR1 |= (1 << 9);
+			return;
+		}
+	}
+	(void)I2C1->SR1;
+	(void)I2C1->SR2;
+	sendStr("addr ok - device answered\r\n");
+	I2C1->CR1 |= (1 << 9);              // STOP
 }
 
 uint8_t mpu_read_reg(uint8_t reg) {
@@ -285,42 +405,9 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  RCC->AHB1ENR |= (1 << 0);// GPIOA clock (from before)
-  RCC->AHB1ENR |= (1 << 1);   // GPIOB clock enable (bit 1 = port B)
-  RCC->APB1ENR |= (1 << 17);//USARTEN enable
-  RCC->APB1ENR |= (1 << 21);// I2C1EN
-  	// USART2 clock (new)
-  GPIOA->MODER &= ~(3 << (2*2));//Resetting the 2 pio's at pin 2 to 0
-  GPIOA->MODER |= (2 << (2*2));
-  GPIOA->MODER &= ~(3 << (2*3));
-  GPIOA->MODER |= (2 << (2*3));
-  GPIOB->MODER &= ~(0xF << (8*2)); // resetting pins PB8 and PB9 to 0
-  GPIOB->MODER |= (0xA << (8*2)); //setting PB8 and PB9 to AF mode (1010)
-
-
-  GPIOA->AFR[0] &= ~(0xF << (4*2));
-  GPIOA->AFR[0] |=  (7   << (4*2));   // PA2 → AF7 (USART2)
-  GPIOA->AFR[0] &= ~(0xF << (4*3));
-  GPIOA->AFR[0] |=  (7   << (4*3));   // PA3 → AF7 (USART2)
-  GPIOB->AFR[1] &= ~((0xF << 0) | (0xF << 4));
-  GPIOB->AFR[1] |= (4 << 0) | (4 << 4);  // PB8 = AF4 (4*0), PB9 = AF4 (4*1) (I2C)
-
-  USART2->BRR = (22 << 4) | 13; //Setting Baud Rate Register via conversion formula
-  USART2->CR1 |= (1<<13); //Activating the USART2
-  USART2->CR1 |= (1<<3); //Transmitter Enabled
-  USART2->CR1 |= (1<<2); //Receiver Enabled
-
-  GPIOB->OTYPER |= (1 << 8) | (1 << 9); //Setting pin 8 and 9 to open-drain
-  GPIOB->PUPDR &= ~(0xF << 16); //Resetting pins
-  GPIOB->PUPDR |= (0X5 << 16); //Setting the pins to 01 and 01
-
-  I2C1->CR1 |= (1 << 15);    // SOFTWARE RESET or SWRST
-  I2C1->CR1 &= ~(1 << 15);
-  I2C1->CR2 |= (42 << 0); //Telling the I2C the clock speed (42MHz apb1)
-  I2C1->CCR |= (210 << 0); //Using the formula from the ref sheet to set clock to 100kHz
-  I2C1->TRISE = 43; //telling the I2C to wait 43 clock ticks before registering signal
-  I2C1->CR1 |= (1 << 0); //Enabling peripheral
-
+  uart2_init();
+  i2c1_init();
+  spi1_init();
 
   SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
@@ -391,7 +478,7 @@ int main(void)
 		angle = (angle + gx_dps*0.01) + 0.02*error;
 		float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
 
-		if (counter%10 == 0) {
+		/* if (counter%10 == 0) {
 		sendStr("A "); sendFloat(ax_g); sendStr(" "); sendFloat(ay_g); sendStr(" "); sendFloat(az_g);
 		sendStr("  G "); sendFloat(gx_dps); sendStr(" "); sendFloat(gy_dps); sendStr(" "); sendFloat(gz_dps);
 		sendStr(" A "); sendFloat(angle);
@@ -400,7 +487,36 @@ int main(void)
 		counter = 0;
 		}
 		counter+=1;
-		delay_ms(10);
+		*/
+
+		sd_power_up();
+		uint8_t r = sd_send_cmd(0, 0, 0x95);   // CMD0
+		sd_deselect();
+
+		r = sd_send_cmd(8, 0x1AA, 0X87);
+		uint8_t r7[4];
+		for (int i = 0; i < 4; i++) r7[i] = spi_transfer(0xFF);
+		sd_deselect();
+
+		//check to see if the reader finished starting up (ACMD41)
+		int tries;
+		for (tries = 0; tries < 1000; tries++) {
+			sd_send_cmd(55, 0, 0x01);
+			sd_deselect();
+			r = sd_send_cmd(41, 0x40000000, 0x01);
+			sd_deselect();
+			if (r == 0) break;
+			delay_ms(1);
+		}
+
+		r = sd_send_cmd(58, 0, 0x01);
+		uint8_t ocr[4];
+		for (int i = 0; i < 4; i++) ocr[i] = spi_transfer(0xFF);
+		sd_deselect();
+
+		sendInt(r); sendStr(" ");
+		sendInt(ocr[0]); sendStr("\r\n");
+		delay_ms(500);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
