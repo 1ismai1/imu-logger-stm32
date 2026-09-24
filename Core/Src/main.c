@@ -44,7 +44,7 @@
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+uint8_t sd_buf[512];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -266,7 +266,69 @@ uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc)
     return r;   // CS stays LOW on purpose (see below)
 }
 
+uint8_t sd_init(void)
+{
+    uint8_t r;
+    uint8_t buf[4];
 
+    sd_power_up();
+
+    // CMD0: go to SPI mode
+    r = sd_send_cmd(0, 0, 0x95);
+    sd_deselect();
+    if (r != 0x01) return 1;
+
+    // CMD8: voltage check
+    r = sd_send_cmd(8, 0x1AA, 0x87);
+    for (int i = 0; i < 4; i++) buf[i] = spi_transfer(0xFF);
+    sd_deselect();
+    if (r != 0x01 || buf[2] != 0x01 || buf[3] != 0xAA) return 2;
+
+    // ACMD41: start up (keep asking, max ~1 s)
+    for (int tries = 0; tries < 1000; tries++) {
+        sd_send_cmd(55, 0, 0x01);
+        sd_deselect();
+        r = sd_send_cmd(41, 0x40000000, 0x01);
+        sd_deselect();
+        if (r == 0) break;
+        delay_ms(1);
+    }
+    if (r != 0) return 3;
+
+    // CMD58: check it's a high-capacity card
+    r = sd_send_cmd(58, 0, 0x01);
+    for (int i = 0; i < 4; i++) buf[i] = spi_transfer(0xFF);
+    sd_deselect();
+    if (r != 0 || !(buf[0] & 0x40)) return 4;
+
+    //Speeding up SPI to 84 MHz /8 = 10.5 MHz (limited by jumper cables. Change when your on PCB)
+    SPI1->CR1 &= ~(1 << 6);
+    SPI1->CR1 &= ~(7 << 3);
+    SPI1->CR1 |= (2 << 3);
+    SPI1->CR1 |= (1 << 6);
+
+    return 0;
+}
+
+uint8_t sd_read_block(uint32_t block, uint8_t *buf)
+{
+	uint8_t r = sd_send_cmd(17, block, 0x01); //read from desired block
+	if (r != 0) { sd_deselect(); return 1; }
+
+	//wait for the 0xFE start token
+	for (int i = 0; i < 1000; i++) {
+		r =spi_transfer(0xFF);
+		if (r == 0xFE) break;
+	}
+	if (r != 0xFE) {sd_deselect(); return 2; }
+
+	// read through 512 bytes
+	for (int i = 0; i < 512; i++) buf[i] = spi_transfer(0xFE);
+
+	spi_transfer(0xFF);
+	spi_transfer(0xFF);
+	return 0;
+}
 /* ---------------- MPU-6050 ---------------- */
 
 #define MPU_ADDR  0x68      // 7-bit address
@@ -409,6 +471,7 @@ int main(void)
   i2c1_init();
   spi1_init();
 
+
   SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
   SysTick->CTRL = (1<<2) | (1<<0); //flips to on (on/off switch) and activates clock source
@@ -430,6 +493,23 @@ int main(void)
   float gyro_angle = 0;
   float angle = 0;
   uint8_t counter = 0;
+
+  uint8_t sd_err = sd_init();
+  sendStr("SD init = ");
+  sendInt(sd_err);
+  sendStr("\r\n");
+
+  uint8_t rd = sd_read_block(0, sd_buf);
+  sendStr("read = ");   sendInt(rd);
+  sendStr("  last 2 bytes = ");
+  sendInt(sd_buf[510]); sendStr(" ");
+  sendInt(sd_buf[511]); sendStr("\r\n");
+
+  for (int i = 0; i < 512; i++) {
+      sendHex(sd_buf[i]);
+      sendStr(" ");
+      if (i % 16 == 15) sendStr("\r\n");
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -489,33 +569,6 @@ int main(void)
 		counter+=1;
 		*/
 
-		sd_power_up();
-		uint8_t r = sd_send_cmd(0, 0, 0x95);   // CMD0
-		sd_deselect();
-
-		r = sd_send_cmd(8, 0x1AA, 0X87);
-		uint8_t r7[4];
-		for (int i = 0; i < 4; i++) r7[i] = spi_transfer(0xFF);
-		sd_deselect();
-
-		//check to see if the reader finished starting up (ACMD41)
-		int tries;
-		for (tries = 0; tries < 1000; tries++) {
-			sd_send_cmd(55, 0, 0x01);
-			sd_deselect();
-			r = sd_send_cmd(41, 0x40000000, 0x01);
-			sd_deselect();
-			if (r == 0) break;
-			delay_ms(1);
-		}
-
-		r = sd_send_cmd(58, 0, 0x01);
-		uint8_t ocr[4];
-		for (int i = 0; i < 4; i++) ocr[i] = spi_transfer(0xFF);
-		sd_deselect();
-
-		sendInt(r); sendStr(" ");
-		sendInt(ocr[0]); sendStr("\r\n");
 		delay_ms(500);
     /* USER CODE BEGIN 3 */
   }
