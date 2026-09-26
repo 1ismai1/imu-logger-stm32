@@ -156,10 +156,23 @@ void i2c1_init(void) {
   I2C1->CR1 |= (1 << 0); //Enabling peripheral
 }
 
-void i2c_start(void) {
-	I2C1->CR1 |= (1<<8); //generate a start condition
-	while (!(I2C1->SR1 & (1 << 0))); //start condition was sent
+uint8_t i2c_wait(uint16_t mask) {
+	uint32_t start = ms_ticks;
+	while(!(I2C1->SR1 & mask)) {
+		if (ms_ticks - start > 2) return 0;
+	}
+	return 1;
+}
 
+uint8_t i2c_fail(void) {
+	I2C1->CR1 |= (1<<9);
+	I2C1->CR1 |= (1<<10);
+	return 0;
+}
+
+uint8_t i2c_start(void) {
+	I2C1->CR1 |= (1<<8); //generate a start condition
+	return i2c_wait(1 << 0);
 }
 
 uint8_t i2c_addr(uint8_t addr, uint8_t read) {
@@ -184,15 +197,18 @@ uint8_t i2c_addr(uint8_t addr, uint8_t read) {
     return 1;
 }
 
-void i2c_write(uint8_t data) {
-	while (!(I2C1->SR1 & (1<<7)));
+uint8_t i2c_write(uint8_t data) {
+	if (!i2c_wait(1 << 7)) return 0;
 	I2C1->DR = data;
-	while (!(I2C1->SR1 & (1 << 2)));
+	return i2c_wait(1 << 2);
+
 }
 
 void i2c_stop(void) {
 	I2C1->CR1 |= (1<<9);
 }
+
+
 
 /* ---------------- SPI1 ---------------- */
 void spi1_init(void) {
@@ -422,61 +438,42 @@ void mpu_probe(void) {
 	I2C1->CR1 |= (1 << 9);              // STOP
 }
 
-uint8_t mpu_read_reg(uint8_t reg) {
-    uint8_t val;
 
-    i2c_start();
-    if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: write addr\r\n"); return 0xFF; }
-    i2c_write(reg);
-
-    i2c_start();
-    I2C1->CR1 &= ~(1 << 10);            // ACK off before clearing ADDR
-    I2C1->DR = (MPU_ADDR << 1) | 1;
-    while (!(I2C1->SR1 & (1 << 1)));    // ADDR
-    (void)I2C1->SR1;
-    (void)I2C1->SR2;
-    I2C1->CR1 |= (1 << 9);              // STOP
-
-    while (!(I2C1->SR1 & (1 << 6)));    // RXNE
-    val = I2C1->DR;
-
-    I2C1->CR1 |= (1 << 10);
-    return val;
+uint8_t mpu_write_reg(uint8_t reg, uint8_t val) {
+    if (!i2c_start() || !i2c_addr(MPU_ADDR, 0) ||
+        !i2c_write(reg) || !i2c_write(val)) return i2c_fail();
+    i2c_stop();
+    return 1;
 }
 
-void mpu_write_reg(uint8_t reg, uint8_t val) {
-	i2c_start();
-	if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: write addr\r\n"); return; } //check if chip answers with a write request
-	i2c_write(reg);
-	i2c_write(val);
-	i2c_stop();
+uint8_t mpu_init(void) {
+    return mpu_write_reg(PWR_MGMT_1, 0x01) &&
+           mpu_write_reg(ACCEL_CONFIG, 0x10) &&
+           mpu_write_reg(GYRO_CONFIG, 0x18);
 }
 
-void mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
-	i2c_start();
-	if (!i2c_addr(MPU_ADDR, 0)) { sendStr("NACK: burst wr\r\n"); return; }
-	i2c_write(reg);
+uint8_t mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
+    if (!i2c_start() || !i2c_addr(MPU_ADDR, 0) || !i2c_write(reg)) return i2c_fail();
 
-	I2C1->CR1 |= (1 << 10);
-	i2c_start();
-	if (!i2c_addr(MPU_ADDR, 1)) { sendStr("NACK: burst rd\r\n"); return; }
+    I2C1->CR1 |= (1 << 10);                        // ACK on
+    if (!i2c_start() || !i2c_addr(MPU_ADDR, 1)) return i2c_fail();
 
-	while (n > 3) {
-		while (!(I2C1->SR1 & (1 << 6)));
-		*buf++ = I2C1->DR;
-		n--;
-	}
+    while (n > 3) {
+        if (!i2c_wait(1 << 6)) return i2c_fail();  // RXNE
+        *buf++ = I2C1->DR;
+        n--;
+    }
 
-	while (!(I2C1->SR1 & (1<<2)));
-	I2C1->CR1 &= ~(1 << 10);
-	*buf++ = I2C1->DR;
-	I2C1->CR1 |= (1 << 9);
-	*buf++ = I2C1->DR;
-	while(!(I2C1->SR1 & (1 << 6)));
-	*buf++ = I2C1->DR;
+    if (!i2c_wait(1 << 2)) return i2c_fail();      // BTF
+    I2C1->CR1 &= ~(1 << 10);                       // ACK off
+    *buf++ = I2C1->DR;
+    I2C1->CR1 |= (1 << 9);                         // STOP
+    *buf++ = I2C1->DR;
+    if (!i2c_wait(1 << 6)) return i2c_fail();      // RXNE
+    *buf++ = I2C1->DR;
 
-	I2C1->CR1 |= (1 << 10);
-
+    I2C1->CR1 |= (1 << 10);                        // ACK back on
+    return 1;
 }
 
 
@@ -528,15 +525,9 @@ int main(void)
   delay_ms(100);              // MPU boot time
   mpu_probe();                // does anything answer at 0x68?
 
-  mpu_write_reg(PWR_MGMT_1, 0x01);   // wake up
-  mpu_write_reg(ACCEL_CONFIG, 0x10);
-  mpu_write_reg(GYRO_CONFIG, 0x18);
+  if (!mpu_init()) sendStr("MPU init FAIL\r\n");
   delay_ms(100);
 
-  // confirm it actually woke
-  sendStr("PWR = 0x");
-  sendHex(mpu_read_reg(PWR_MGMT_1));
-  sendStr("\r\n");
 
   uint8_t raw[14];
   float angle = 0;
@@ -573,7 +564,13 @@ int main(void)
   {
 	  	while (ms_ticks < next);
 	  	next += 10;
-		mpu_read_burst(ACCEL_XOUT_H, raw, 14);
+	  	if (!mpu_read_burst(ACCEL_XOUT_H, raw, 14) || (raw[0] | raw[1] | raw[2] | raw[3] | raw[4] | raw[5]) == 0) {
+	  	    i2c1_init();
+	  	    mpu_init();
+	  	    next  = ms_ticks + 10;
+	  	    first = 1;
+	  	    continue;
+	  	}
 
 		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
 		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
