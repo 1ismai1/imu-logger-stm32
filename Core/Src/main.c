@@ -47,6 +47,7 @@ UART_HandleTypeDef huart2;
 uint8_t sd_buf[512];
 FATFS fs;
 FIL file;
+volatile uint32_t ms_ticks = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -518,13 +519,14 @@ int main(void)
   SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
   SysTick->CTRL = (1<<2) | (1<<0); //flips to on (on/off switch) and activates clock source
+  SysTick->CTRL = (1<<2) | (1<<1) | (1<<0);
 
   delay_ms(100);              // MPU boot time
   mpu_probe();                // does anything answer at 0x68?
 
   mpu_write_reg(PWR_MGMT_1, 0x01);   // wake up
-  mpu_write_reg(ACCEL_CONFIG, 0x08);
-  mpu_write_reg(GYRO_CONFIG, 0x08);
+  mpu_write_reg(ACCEL_CONFIG, 0x10);
+  mpu_write_reg(GYRO_CONFIG, 0x18);
   delay_ms(100);
 
   // confirm it actually woke
@@ -568,17 +570,20 @@ int main(void)
   sendStr("  bad bytes = "); sendInt(bad);
   sendStr("\r\n");
 
-  FRESULT r; UINT written;
-  r = f_mount(&fs, "", 1);                                  sendStr("mount ");  sendInt(r); sendStr("\r\n");
-  r = f_open(&file, "TEST.TXT", FA_WRITE | FA_CREATE_ALWAYS); sendStr("open ");   sendInt(r); sendStr("\r\n");
-  r = f_write(&file, "hello from STM32\r\n", 18, &written);  sendStr("write ");  sendInt(r); sendStr("\r\n");
-  r = f_close(&file);                                        sendStr("close ");  sendInt(r); sendStr("\r\n");
-  /* USER CODE END 2 */
+  FRESULT r;
+  r = f_mount(&fs, "", 1);                               sendStr("mount "); sendInt(r); sendStr("\r\n");
+  r = f_open(&file, "LOG.CSV", FA_WRITE | FA_CREATE_ALWAYS); sendStr("open ");  sendInt(r); sendStr("\r\n");
+  f_printf(&file, "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n");   // header row
+
+  uint32_t next = ms_ticks;   // when the next loop should start
+  uint16_t lines = 0;         // lines written since the last save
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  	while (ms_ticks < next);
+	  			next += 10;
 		mpu_read_burst(ACCEL_XOUT_H, raw, 14);
 
 		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
@@ -590,13 +595,13 @@ int main(void)
 
 
 		//subtracting gyroscope biases
-		gx -= -404;
-		gy -= -206;
-		gz -= -5;
+		gx -= -101;
+		gy -= -52;
+		gz -= -1;
 
-		float ax_g = ax/8192.0f;
-		float ay_g = ay/8192.0f;
-		float az_g = az/8192.0f;
+		float ax_g = ax/4096.0f;
+		float ay_g = ay/4096.0f;
+		float az_g = az/4096.0f;
 
 		ax_g -= 0.095f;
 		ay_g += 0.025f;
@@ -604,9 +609,9 @@ int main(void)
 
 		float acc_angle = atan2f(ay_g,az_g)*57.2958f;
 
-		float gx_dps = gx/65.5f;
-		float gy_dps = gy/65.5f;
-		float gz_dps = gz/65.5f;
+		float gx_dps = gx/16.4f;
+		float gy_dps = gy/16.4f;
+		float gz_dps = gz/16.4f;
 
 		gyro_angle += gx_dps*0.01f;
 
@@ -619,20 +624,30 @@ int main(void)
 		}
 
 		angle = (angle + gx_dps*0.01f) + 0.02f*error;
+		if (angle > 180) angle -= 360;
+		else if (angle < -180) angle += 360;
 		float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
 
-		/* if (counter%10 == 0) {
-		sendStr("A "); sendFloat(ax_g); sendStr(" "); sendFloat(ay_g); sendStr(" "); sendFloat(az_g);
-		sendStr("  G "); sendFloat(gx_dps); sendStr(" "); sendFloat(gy_dps); sendStr(" "); sendFloat(gz_dps);
-		sendStr(" A "); sendFloat(angle);
-		sendStr(" P "); sendFloat(pitch);
-		sendStr("\r\n");
-		counter = 0;
-		}
-		counter+=1;
-		*/
+//		 if (counter%10 == 0) {
+//		sendStr("A "); sendFloat(ax); sendStr(" "); sendFloat(ay); sendStr(" "); sendFloat(az);
+//		sendStr("  G "); sendFloat(gx); sendStr(" "); sendFloat(gy); sendStr(" "); sendFloat(gz);
+//		sendStr(" A "); sendFloat(angle*100);
+//		sendStr(" P "); sendFloat(pitch*100);
+//		sendStr("\r\n");
+//		counter = 0;
+//		}
+//		counter+=1;
 
-		delay_ms(500);
+
+		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
+				ms_ticks, ax, ay, az, gx, gy, gz,
+				(int)(angle*100), (int)(pitch*100));
+		if (++lines >= 100) {
+			if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
+			lines = 0;
+
+		}
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
