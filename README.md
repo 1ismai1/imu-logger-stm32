@@ -36,8 +36,10 @@ Taps swing the raw accelerometer angle by ±150°; the filtered angle moves a fr
 | SPI1 MOSI → SD DI | PA7 | D11 |
 | SD chip select | PB6 | D10 |
 | USART2 TX/RX (debug, 115200 baud) | PA2 / PA3 | via ST-Link USB |
-
-Power and ground for both breakouts come from the Nucleo's power header.
+| MPU-6050 VIN | — | 3V3 |
+| MPU-6050 GND | — | GND |
+| SD reader VCC | — | 5V |
+| SD reader GND | — | GND |
 
 ## Log format
 
