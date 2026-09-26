@@ -18,11 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
+#include "ff.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,6 +45,8 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 uint8_t sd_buf[512];
+FATFS fs;
+FIL file;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -268,15 +270,28 @@ uint8_t sd_send_cmd(uint8_t cmd, uint32_t arg, uint8_t crc)
 
 uint8_t sd_init(void)
 {
+	// Back to slow speed: the card must be woken up below 400 kHz
+	SPI1->CR1 &= ~(1 << 6);   // SPI off (speed can only change while off)
+	SPI1->CR1 |=  (7 << 3);   // BR = 111 → 84 MHz / 256 ≈ 328 kHz
+	SPI1->CR1 |=  (1 << 6);   // SPI on
     uint8_t r;
     uint8_t buf[4];
 
     sd_power_up();
 
-    // CMD0: go to SPI mode
-    r = sd_send_cmd(0, 0, 0x95);
+    // waiting for  card that may be stuck mid-read from a previous run
+    sd_select();
+    for (int i = 0; i < 600; i++) spi_transfer(0xFF);
     sd_deselect();
-    if (r != 0x01) return 1;
+    // CMD0: go to SPI mode
+    // CMD0: go to SPI mode. Retry, because a stuck card may ignore the first one
+    for (int tries = 0; tries < 10; tries++) {
+        r = sd_send_cmd(0, 0, 0x95);
+        sd_deselect();
+        if (r == 0x01) break;
+        delay_ms(10);
+    }
+    if (r != 0x01) { sendStr("CMD0 reply = 0x"); sendHex(r); sendStr("\r\n"); return 1; }
 
     // CMD8: voltage check
     r = sd_send_cmd(8, 0x1AA, 0x87);
@@ -316,17 +331,17 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 	if (r != 0) { sd_deselect(); return 1; }
 
 	//wait for the 0xFE start token
-	for (int i = 0; i < 1000; i++) {
+	for (int i = 0; i < 100000; i++) {
 		r =spi_transfer(0xFF);
 		if (r == 0xFE) break;
 	}
 	if (r != 0xFE) {sd_deselect(); return 2; }
 
 	// read through 512 bytes
-	for (int i = 0; i < 512; i++) buf[i] = spi_transfer(0xFE);
-
-	spi_transfer(0xFF);
-	spi_transfer(0xFF);
+	for (int i = 0; i < 512; i++) buf[i] = spi_transfer(0xFF);  // 0xFF, not 0xFE
+	spi_transfer(0xFF);   // CRC byte 1 (ignored)
+	spi_transfer(0xFF);   // CRC byte 2 (ignored)
+	sd_deselect();        // release the card
 	return 0;
 }
 
@@ -346,7 +361,7 @@ uint8_t sd_write_block(uint32_t block, uint8_t *buf)
 	    r = spi_transfer(0xFF);
 	    if (r != 0xFF) break;
 	}
-	sd_last_resp = r;
+
 	if ((r & 0x1F) != 0x05) { sd_deselect(); return 2; }
 
 	uint32_t wait = 0;
@@ -553,6 +568,11 @@ int main(void)
   sendStr("  bad bytes = "); sendInt(bad);
   sendStr("\r\n");
 
+  FRESULT r; UINT written;
+  r = f_mount(&fs, "", 1);                                  sendStr("mount ");  sendInt(r); sendStr("\r\n");
+  r = f_open(&file, "TEST.TXT", FA_WRITE | FA_CREATE_ALWAYS); sendStr("open ");   sendInt(r); sendStr("\r\n");
+  r = f_write(&file, "hello from STM32\r\n", 18, &written);  sendStr("write ");  sendInt(r); sendStr("\r\n");
+  r = f_close(&file);                                        sendStr("close ");  sendInt(r); sendStr("\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -598,7 +618,7 @@ int main(void)
 			error += 360;
 		}
 
-		angle = (angle + gx_dps*0.01) + 0.02*error;
+		angle = (angle + gx_dps*0.01f) + 0.02f*error;
 		float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
 
 		/* if (counter%10 == 0) {
