@@ -211,7 +211,7 @@ void spi1_init(void) {
   GPIOB->BSRR = (1 << 6); //setting pin HIGH (basically setting it idle)
 
   GPIOA->PUPDR &= ~(3 << 12);
-  GPIOA->PUPDR |= (3 << 12);
+  GPIOA->PUPDR |= (1 << 12);
 
   SPI1->CR1 = (1 << 2) //MSTR:  stm32 is master
   	  	  	| (7 << 3) //BR: 84MHz / 256 = 328kHz (Sd cards need less than 400kHz)
@@ -283,6 +283,11 @@ uint8_t sd_init(void)
     // waiting for  card that may be stuck mid-read from a previous run
     sd_select();
     for (int i = 0; i < 600; i++) spi_transfer(0xFF);
+    sd_deselect();
+
+    sd_select();
+    uint32_t t = 0;
+    while (spi_transfer(0xFF) != 0xFF && ++t < 50000);   // up to ~1.5 s
     sd_deselect();
     // CMD0: go to SPI mode
     // CMD0: go to SPI mode. Retry, because a stuck card may ignore the first one
@@ -463,14 +468,14 @@ void mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
 	}
 
 	while (!(I2C1->SR1 & (1<<2)));
-		I2C1->CR1 &= ~(1 << 10);
-		*buf++ = I2C1->DR;
-		I2C1->CR1 |= (1 << 9);
-		*buf++ = I2C1->DR;
-		while(!(I2C1->SR1 & (1 << 6)));
-		*buf++ = I2C1->DR;
+	I2C1->CR1 &= ~(1 << 10);
+	*buf++ = I2C1->DR;
+	I2C1->CR1 |= (1 << 9);
+	*buf++ = I2C1->DR;
+	while(!(I2C1->SR1 & (1 << 6)));
+	*buf++ = I2C1->DR;
 
-		I2C1->CR1 |= (1 << 10);
+	I2C1->CR1 |= (1 << 10);
 
 }
 
@@ -518,7 +523,6 @@ int main(void)
 
   SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
-  SysTick->CTRL = (1<<2) | (1<<0); //flips to on (on/off switch) and activates clock source
   SysTick->CTRL = (1<<2) | (1<<1) | (1<<0);
 
   delay_ms(100);              // MPU boot time
@@ -535,44 +539,29 @@ int main(void)
   sendStr("\r\n");
 
   uint8_t raw[14];
-  float gyro_angle = 0;
   float angle = 0;
-  uint8_t counter = 0;
+  float pitch_f = 0;   // filtered pitch
+  uint8_t first = 1;   // 1 until the first loop pass is done
+
 
   uint8_t sd_err = sd_init();
   sendStr("SD init = ");
   sendInt(sd_err);
   sendStr("\r\n");
 
-  uint8_t rd = sd_read_block(0, sd_buf);
-  sendStr("read = ");   sendInt(rd);
-  sendStr("  last 2 bytes = ");
-  sendInt(sd_buf[510]); sendStr(" ");
-  sendInt(sd_buf[511]); sendStr("\r\n");
-
-  for (int i = 0; i < 512; i++) sd_buf[i] = (uint8_t)i;
-
-  uint8_t wr = sd_write_block(1000, sd_buf);
-
-  // Wipe the buffer so we know the data really came from the card
-  for (int i = 0; i < 512; i++) sd_buf[i] = 0;
-
-  uint8_t rd2 = sd_read_block(1000, sd_buf);
-
-  // Check every byte matches the pattern
-  int bad = 0;
-  for (int i = 0; i < 512; i++) {
-      if (sd_buf[i] != (uint8_t)i) bad++;
-  }
-
-  sendStr("write = ");  sendInt(wr);
-  sendStr("  read = "); sendInt(rd2);
-  sendStr("  bad bytes = "); sendInt(bad);
-  sendStr("\r\n");
 
   FRESULT r;
   r = f_mount(&fs, "", 1);                               sendStr("mount "); sendInt(r); sendStr("\r\n");
-  r = f_open(&file, "LOG.CSV", FA_WRITE | FA_CREATE_ALWAYS); sendStr("open ");  sendInt(r); sendStr("\r\n");
+  char name[] = "LOG000.CSV";
+  for (int n = 0; n <1000; n++) {
+	name[3] = '0' + n/100;
+	name[4] = '0' + (n/10)%10;
+	name[5] = '0' + n % 10;
+	r = f_open(&file, name, FA_WRITE | FA_CREATE_NEW);
+	if (r != FR_EXIST) break;
+  }
+  sendStr("file "); sendStr(name); sendStr(" open "); sendInt(r); sendStr("\r\n");
+  if (r != FR_OK) { sendStr("NO LOG FILE - stopping\r\n"); while (1); }
   f_printf(&file, "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n");   // header row
 
   uint32_t next = ms_ticks;   // when the next loop should start
@@ -583,7 +572,7 @@ int main(void)
   while (1)
   {
 	  	while (ms_ticks < next);
-	  			next += 10;
+	  	next += 10;
 		mpu_read_burst(ACCEL_XOUT_H, raw, 14);
 
 		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
@@ -607,13 +596,16 @@ int main(void)
 		ay_g += 0.025f;
 		az_g += 0.22f;
 
-		float acc_angle = atan2f(ay_g,az_g)*57.2958f;
-
+		float acc_angle = atan2f(ay_g, az_g) * 57.2958f;
+		float acc_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
+		if (first) {
+		    angle   = acc_angle;   // start both filters at the true angle, not 0
+		    pitch_f = acc_pitch;
+		    first   = 0;
+		}
 		float gx_dps = gx/16.4f;
 		float gy_dps = gy/16.4f;
-		float gz_dps = gz/16.4f;
 
-		gyro_angle += gx_dps*0.01f;
 
 		float error = acc_angle - angle;
 		if (error > 180) {
@@ -623,25 +615,19 @@ int main(void)
 			error += 360;
 		}
 
+
+
 		angle = (angle + gx_dps*0.01f) + 0.02f*error;
 		if (angle > 180) angle -= 360;
 		else if (angle < -180) angle += 360;
-		float pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
+		pitch_f = (pitch_f + gy_dps*0.01f) + 0.02f*(acc_pitch - pitch_f);
 
-//		 if (counter%10 == 0) {
-//		sendStr("A "); sendFloat(ax); sendStr(" "); sendFloat(ay); sendStr(" "); sendFloat(az);
-//		sendStr("  G "); sendFloat(gx); sendStr(" "); sendFloat(gy); sendStr(" "); sendFloat(gz);
-//		sendStr(" A "); sendFloat(angle*100);
-//		sendStr(" P "); sendFloat(pitch*100);
-//		sendStr("\r\n");
-//		counter = 0;
-//		}
-//		counter+=1;
-
+		if (pitch_f > 90)       pitch_f = 90;
+		else if (pitch_f < -90) pitch_f = -90;
 
 		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
 				ms_ticks, ax, ay, az, gx, gy, gz,
-				(int)(angle*100), (int)(pitch*100));
+				(int)(angle*100), (int)(pitch_f*100));
 		if (++lines >= 100) {
 			if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
 			lines = 0;
