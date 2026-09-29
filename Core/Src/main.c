@@ -338,7 +338,7 @@ uint8_t sd_init(void)
     sd_deselect();
     if (r != 0 || !(buf[0] & 0x40)) return 4;
 
-    //Speeding up SPI to 84 MHz /8 = 10.5 MHz (limited by jumper cables. Change when your on PCB)
+    //Speeding up SPI to 84 MHz /32 = 2.6 MHz (limited by jumper cables. Change when your on PCB)
     SPI1->CR1 &= ~(1 << 6);
     SPI1->CR1 &= ~(7 << 3);
     SPI1->CR1 |= (2 << 3);
@@ -476,7 +476,11 @@ uint8_t mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
     return 1;
 }
 
-
+void debug_pin_init(void) {
+  RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
+  GPIOA->MODER &= ~(3 << 16);   // clear PA8's mode bits
+  GPIOA->MODER |=  (1 << 16);   // 01 = output
+}
 /* USER CODE END 0 */
 
 /**
@@ -516,7 +520,7 @@ int main(void)
   uart2_init();
   i2c1_init();
   spi1_init();
-
+  debug_pin_init();
 
   SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
   SysTick->VAL = 0; //resets count down to 0
@@ -564,11 +568,14 @@ int main(void)
   {
 	  	while (ms_ticks < next);
 	  	next += 10;
+	  	GPIOA->BSRR = (1 << 8);
+
 	  	if (!mpu_read_burst(ACCEL_XOUT_H, raw, 14) || (raw[0] | raw[1] | raw[2] | raw[3] | raw[4] | raw[5]) == 0) {
 	  	    i2c1_init();
 	  	    mpu_init();
 	  	    next  = ms_ticks + 10;
 	  	    first = 1;
+	  	    GPIOA->BSRR = (1 << (8 + 16));
 	  	    continue;
 	  	}
 
@@ -630,6 +637,8 @@ int main(void)
 			lines = 0;
 
 		}
+
+		GPIOA->BSRR = (1 << (8 + 16));
 
     /* USER CODE BEGIN 3 */
   }
