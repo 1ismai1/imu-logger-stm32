@@ -24,6 +24,8 @@
 /* USER CODE BEGIN Includes */
 #include <math.h>
 #include "ff.h"
+#include "FreeRTOS.h"
+#include "task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -74,7 +76,10 @@ void logger_task(void *arg);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void delay_ms(uint32_t ms) {
-  HAL_Delay(ms);   // HAL's 1 ms tick counter (no more hand-rolled SysTick)
+  if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+    vTaskDelay(pdMS_TO_TICKS(ms));   // inside a task: sleep, CPU goes to other tasks
+  else
+    HAL_Delay(ms);                   // before FreeRTOS starts: busy-wait on HAL's tick
 }
 
 /* ---------------- UART2 ---------------- */
@@ -621,12 +626,12 @@ int main(void)
   TIM2->SR   = 0;                // EGR set UIF, clear it
   TIM2->DIER |= (1 << 0);        // interrupt on rollover
 
-  NVIC_SetPriority(SysTick_IRQn, 0);   // SysTick MORE urgent, so HAL_GetTick() keeps counting inside the ISR
+  // HAL's tick (TIM1) is priority 0, so HAL_GetTick() keeps counting inside this ISR.
+  // TIM2 calls no FreeRTOS functions, so it's allowed to be above FreeRTOS's limit (5).
   NVIC_SetPriority(TIM2_IRQn, 1);
   NVIC_EnableIRQ(TIM2_IRQn);
   TIM2->CR1 |= (1 << 0);         // start
 
-  logger_task(NULL);         // never returns (for now: runs the old superloop)
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -653,7 +658,10 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  // logger: 1024 words (4 KB) of stack, f_printf + float math need room.
+  // Priority: CubeMX's scale is 0-55. Heartbeat = Normal (24), logger = AboveNormal (32): data wins.
+  if (xTaskCreate(logger_task, "logger", 1024, NULL, osPriorityAboveNormal, NULL) != pdPASS)
+    sendStr("logger task create FAIL\r\n");
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -837,10 +845,10 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* Logger: drains the ring buffer, runs the filters, writes the CSV.
-   Later this becomes a FreeRTOS task; for now main() just calls it. */
+/* Logger task: drains the ring buffer, runs the filters, writes the CSV. */
 void logger_task(void *arg) {
   (void)arg;
+  sendStr("logger task running\r\n");
   float angle = 0;
   float pitch_f = 0;   // filtered pitch
   uint8_t first = 1;   // 1 until the first loop pass is done
@@ -923,6 +931,7 @@ void logger_task(void *arg) {
 			}
 	  	}
 
+	  	vTaskDelay(pdMS_TO_TICKS(10));   // buffer empty: sleep 10 ms so other tasks get the CPU
   }
 }
 
@@ -938,10 +947,18 @@ void logger_task(void *arg) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
+  /* Heartbeat task: square wave on PA10 (Arduino D2), flips every 250 ms.
+     Proves the scheduler is switching tasks. Watch it on the logic analyzer. */
+  GPIOA->MODER &= ~(3 << 20);   // PA10 mode bits cleared
+  GPIOA->MODER |=  (1 << 20);   // 01 = output
+  uint8_t on = 0;
   for(;;)
   {
-    osDelay(1);
+    on = !on;
+    // BSRR, not ODR ^= : a read-modify-write of ODR could be interrupted by the
+    // TIM2 ISR changing PA8, and we'd write PA8's old value back.
+    GPIOA->BSRR = on ? (1 << 10) : (1 << (10 + 16));
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
   /* USER CODE END 5 */
 }
