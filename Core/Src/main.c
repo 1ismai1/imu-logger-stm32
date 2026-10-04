@@ -476,6 +476,61 @@ uint8_t mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
     return 1;
 }
 
+/* ---------------- Ring buffer + TIM2 ISR ----------------*/
+/* Timer interrupt samples the IMU every 10 ms into the ring buffer.
+   Main loop drains it to the SD card whenever it has time.            */
+typedef struct {
+	uint32_t ms;       // timestamp when sampled
+	uint8_t  raw[14];  // the burst read, untouched
+} sample_t;
+
+#define RB_SIZE 256              // must be a power of 2
+#define RB_MASK (RB_SIZE - 1)
+
+static sample_t rb[RB_SIZE];
+static volatile uint32_t rb_head = 0;      // only the ISR writes this
+static volatile uint32_t rb_tail = 0;      // only main writes this
+static volatile uint32_t rb_dropped = 0;   // samples lost because buffer was full
+static volatile uint32_t rb_max_fill = 0;  // worst backlog seen
+static volatile uint8_t  imu_fault = 0;    // ISR sets it, main fixes it
+
+void TIM2_IRQHandler(void) {
+	if (TIM2->SR & (1 << 0)) {             // UIF: timer rolled over
+		TIM2->SR = ~(1u << 0);             // clear UIF only
+
+		if (imu_fault) return;             // main is fixing the sensor, hands off I2C
+		if (rb_head - rb_tail >= RB_SIZE) { rb_dropped++; return; }
+
+		GPIOA->BSRR = (1 << 8);            // debug pin HIGH = ISR running
+
+		sample_t *s = &rb[rb_head & RB_MASK];
+		s->ms = ms_ticks;
+		uint8_t *r = s->raw;
+		if (!mpu_read_burst(ACCEL_XOUT_H, r, 14) ||
+		    (r[0] | r[1] | r[2] | r[3] | r[4] | r[5]) == 0) {   // all-zero = sleeping sensor (Bug 17)
+			imu_fault = 1;
+			GPIOA->BSRR = (1 << (8 + 16));
+			return;
+		}
+
+		__DMB();                           // data fully written BEFORE head moves
+		rb_head++;
+
+		uint32_t fill = rb_head - rb_tail;
+		if (fill > rb_max_fill) rb_max_fill = fill;
+
+		GPIOA->BSRR = (1 << (8 + 16));     // debug pin LOW
+	}
+}
+
+static int rb_pop(sample_t *out) {
+	if (rb_head == rb_tail) return 0;      // empty
+	*out = rb[rb_tail & RB_MASK];
+	__DMB();                               // finish copying BEFORE tail moves
+	rb_tail++;
+	return 1;
+}
+
 void debug_pin_init(void) {
   RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
   GPIOA->MODER &= ~(3 << 16);   // clear PA8's mode bits
@@ -522,7 +577,7 @@ int main(void)
   spi1_init();
   debug_pin_init();
 
-  SysTick->LOAD = 84000 - 1; //start count down from 1ms because 42MHz
+  SysTick->LOAD = 84000 - 1; //1 ms tick: 84 MHz / 84000
   SysTick->VAL = 0; //resets count down to 0
   SysTick->CTRL = (1<<2) | (1<<1) | (1<<0);
 
@@ -533,7 +588,6 @@ int main(void)
   delay_ms(100);
 
 
-  uint8_t raw[14];
   float angle = 0;
   float pitch_f = 0;   // filtered pitch
   uint8_t first = 1;   // 1 until the first loop pass is done
@@ -559,25 +613,37 @@ int main(void)
   if (r != FR_OK) { sendStr("NO LOG FILE - stopping\r\n"); while (1); }
   f_printf(&file, "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n");   // header row
 
-  uint32_t next = ms_ticks;   // when the next loop should start
+  /*------Timer Setup: started LAST, after everything else that uses I2C / takes time-----*/
+  RCC->APB1ENR |= (1 << 0);      // TIM2 clock on
+  TIM2->PSC  = 8400 - 1;         // 84 MHz timer clock / 8400 = 10 kHz
+  TIM2->ARR  = 100 - 1;          // 10 kHz / 100 = 100 Hz (every 10 ms)
+  TIM2->EGR  = (1 << 0);         // load PSC now (it's buffered)
+  TIM2->SR   = 0;                // EGR set UIF, clear it
+  TIM2->DIER |= (1 << 0);        // interrupt on rollover
+
+  NVIC_SetPriority(SysTick_IRQn, 0);   // SysTick MORE urgent, so ms_ticks keeps counting inside the ISR
+  NVIC_SetPriority(TIM2_IRQn, 1);
+  NVIC_EnableIRQ(TIM2_IRQn);
+  TIM2->CR1 |= (1 << 0);         // start
+
   uint16_t lines = 0;         // lines written since the last save
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  	while (ms_ticks < next);
-	  	next += 10;
-	  	GPIOA->BSRR = (1 << 8);
-
-	  	if (!mpu_read_burst(ACCEL_XOUT_H, raw, 14) || (raw[0] | raw[1] | raw[2] | raw[3] | raw[4] | raw[5]) == 0) {
-	  	    i2c1_init();
-	  	    mpu_init();
-	  	    next  = ms_ticks + 10;
-	  	    first = 1;
-	  	    GPIOA->BSRR = (1 << (8 + 16));
-	  	    continue;
+	  	if (imu_fault) {
+	  		NVIC_DisableIRQ(TIM2_IRQn);     // ISR can't touch I2C while we fix it
+	  		i2c1_init();                    // SWRST + reconfigure
+	  		imu_fault = !mpu_init();        // stays 1 if sensor still missing -> retry next pass
+	  		first = 1;                      // re-snap filters to the accelerometer
+	  		NVIC_EnableIRQ(TIM2_IRQn);
 	  	}
+
+
+	  	sample_t s;
+	  	while (rb_pop(&s)) {
+	  		uint8_t *raw = s.raw;           // rest of the code below is unchanged
 
 		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
 		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
@@ -630,15 +696,16 @@ int main(void)
 		else if (pitch_f < -90) pitch_f = -90;
 
 		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
-				ms_ticks, ax, ay, az, gx, gy, gz,
+				s.ms, ax, ay, az, gx, gy, gz,
 				(int)(angle*100), (int)(pitch_f*100));
-		if (++lines >= 100) {
-			if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
-			lines = 0;
 
-		}
-
-		GPIOA->BSRR = (1 << (8 + 16));
+			if (++lines >= 100) {           // once per second of data
+				if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
+				lines = 0;
+				sendStr("fill "); sendInt((int16_t)rb_max_fill);
+				sendStr(" drop "); sendInt((int16_t)rb_dropped); sendStr("\r\n");
+			}
+	  	}
 
     /* USER CODE BEGIN 3 */
   }
