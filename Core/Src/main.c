@@ -47,7 +47,6 @@ UART_HandleTypeDef huart2;
 uint8_t sd_buf[512];
 FATFS fs;
 FIL file;
-volatile uint32_t ms_ticks = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -55,15 +54,14 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+void logger_task(void *arg);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void delay_ms(int ms) {
-for (int i=0; i < ms; i++) {
-  while (!(SysTick->CTRL & (1<<16)));
-}
+void delay_ms(uint32_t ms) {
+  HAL_Delay(ms);   // HAL's 1 ms tick counter (no more hand-rolled SysTick)
 }
 
 /* ---------------- UART2 ---------------- */
@@ -157,9 +155,9 @@ void i2c1_init(void) {
 }
 
 uint8_t i2c_wait(uint16_t mask) {
-	uint32_t start = ms_ticks;
+	uint32_t start = HAL_GetTick();
 	while(!(I2C1->SR1 & mask)) {
-		if (ms_ticks - start > 2) return 0;
+		if (HAL_GetTick() - start > 2) return 0;
 	}
 	return 1;
 }
@@ -504,7 +502,7 @@ void TIM2_IRQHandler(void) {
 		GPIOA->BSRR = (1 << 8);            // debug pin HIGH = ISR running
 
 		sample_t *s = &rb[rb_head & RB_MASK];
-		s->ms = ms_ticks;
+		s->ms = HAL_GetTick();
 		uint8_t *r = s->raw;
 		if (!mpu_read_burst(ACCEL_XOUT_H, r, 14) ||
 		    (r[0] | r[1] | r[2] | r[3] | r[4] | r[5]) == 0) {   // all-zero = sleeping sensor (Bug 17)
@@ -577,20 +575,11 @@ int main(void)
   spi1_init();
   debug_pin_init();
 
-  SysTick->LOAD = 84000 - 1; //1 ms tick: 84 MHz / 84000
-  SysTick->VAL = 0; //resets count down to 0
-  SysTick->CTRL = (1<<2) | (1<<1) | (1<<0);
-
   delay_ms(100);              // MPU boot time
   mpu_probe();                // does anything answer at 0x68?
 
   if (!mpu_init()) sendStr("MPU init FAIL\r\n");
   delay_ms(100);
-
-
-  float angle = 0;
-  float pitch_f = 0;   // filtered pitch
-  uint8_t first = 1;   // 1 until the first loop pass is done
 
 
   uint8_t sd_err = sd_init();
@@ -621,91 +610,19 @@ int main(void)
   TIM2->SR   = 0;                // EGR set UIF, clear it
   TIM2->DIER |= (1 << 0);        // interrupt on rollover
 
-  NVIC_SetPriority(SysTick_IRQn, 0);   // SysTick MORE urgent, so ms_ticks keeps counting inside the ISR
+  NVIC_SetPriority(SysTick_IRQn, 0);   // SysTick MORE urgent, so HAL_GetTick() keeps counting inside the ISR
   NVIC_SetPriority(TIM2_IRQn, 1);
   NVIC_EnableIRQ(TIM2_IRQn);
   TIM2->CR1 |= (1 << 0);         // start
 
-  uint16_t lines = 0;         // lines written since the last save
+  logger_task(NULL);         // never returns (for now: runs the old superloop)
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  	if (imu_fault) {
-	  		NVIC_DisableIRQ(TIM2_IRQn);     // ISR can't touch I2C while we fix it
-	  		i2c1_init();                    // SWRST + reconfigure
-	  		imu_fault = !mpu_init();        // stays 1 if sensor still missing -> retry next pass
-	  		first = 1;                      // re-snap filters to the accelerometer
-	  		NVIC_EnableIRQ(TIM2_IRQn);
-	  	}
-
-
-	  	sample_t s;
-	  	while (rb_pop(&s)) {
-	  		uint8_t *raw = s.raw;           // rest of the code below is unchanged
-
-		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
-		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
-		int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
-		int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
-		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
-		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
-
-
-		//subtracting gyroscope biases
-		gx -= -101;
-		gy -= -52;
-		gz -= -1;
-
-		float ax_g = ax/4096.0f;
-		float ay_g = ay/4096.0f;
-		float az_g = az/4096.0f;
-
-		ax_g -= 0.095f;
-		ay_g += 0.025f;
-		az_g += 0.22f;
-
-		float acc_angle = atan2f(ay_g, az_g) * 57.2958f;
-		float acc_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
-		if (first) {
-		    angle   = acc_angle;   // start both filters at the true angle, not 0
-		    pitch_f = acc_pitch;
-		    first   = 0;
-		}
-		float gx_dps = gx/16.4f;
-		float gy_dps = gy/16.4f;
-
-
-		float error = acc_angle - angle;
-		if (error > 180) {
-			error -= 360;
-		}
-		else if (error < -180) {
-			error += 360;
-		}
-
-
-
-		angle = (angle + gx_dps*0.01f) + 0.02f*error;
-		if (angle > 180) angle -= 360;
-		else if (angle < -180) angle += 360;
-		pitch_f = (pitch_f + gy_dps*0.01f) + 0.02f*(acc_pitch - pitch_f);
-
-		if (pitch_f > 90)       pitch_f = 90;
-		else if (pitch_f < -90) pitch_f = -90;
-
-		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
-				s.ms, ax, ay, az, gx, gy, gz,
-				(int)(angle*100), (int)(pitch_f*100));
-
-			if (++lines >= 100) {           // once per second of data
-				if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
-				lines = 0;
-				sendStr("fill "); sendInt((int16_t)rb_max_fill);
-				sendStr(" drop "); sendInt((int16_t)rb_dropped); sendStr("\r\n");
-			}
-	  	}
+    /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
@@ -831,6 +748,94 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* Logger: drains the ring buffer, runs the filters, writes the CSV.
+   Later this becomes a FreeRTOS task; for now main() just calls it. */
+void logger_task(void *arg) {
+  (void)arg;
+  float angle = 0;
+  float pitch_f = 0;   // filtered pitch
+  uint8_t first = 1;   // 1 until the first loop pass is done
+  uint16_t lines = 0;  // lines written since the last save
+
+  while (1)
+  {
+	  	if (imu_fault) {
+	  		NVIC_DisableIRQ(TIM2_IRQn);     // ISR can't touch I2C while we fix it
+	  		i2c1_init();                    // SWRST + reconfigure
+	  		imu_fault = !mpu_init();        // stays 1 if sensor still missing -> retry next pass
+	  		first = 1;                      // re-snap filters to the accelerometer
+	  		NVIC_EnableIRQ(TIM2_IRQn);
+	  	}
+
+
+	  	sample_t s;
+	  	while (rb_pop(&s)) {
+	  		uint8_t *raw = s.raw;           // rest of the code below is unchanged
+
+		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
+		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
+		int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
+		int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
+		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
+		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
+
+
+		//subtracting gyroscope biases
+		gx -= -101;
+		gy -= -52;
+		gz -= -1;
+
+		float ax_g = ax/4096.0f;
+		float ay_g = ay/4096.0f;
+		float az_g = az/4096.0f;
+
+		ax_g -= 0.095f;
+		ay_g += 0.025f;
+		az_g += 0.22f;
+
+		float acc_angle = atan2f(ay_g, az_g) * 57.2958f;
+		float acc_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
+		if (first) {
+		    angle   = acc_angle;   // start both filters at the true angle, not 0
+		    pitch_f = acc_pitch;
+		    first   = 0;
+		}
+		float gx_dps = gx/16.4f;
+		float gy_dps = gy/16.4f;
+
+
+		float error = acc_angle - angle;
+		if (error > 180) {
+			error -= 360;
+		}
+		else if (error < -180) {
+			error += 360;
+		}
+
+
+
+		angle = (angle + gx_dps*0.01f) + 0.02f*error;
+		if (angle > 180) angle -= 360;
+		else if (angle < -180) angle += 360;
+		pitch_f = (pitch_f + gy_dps*0.01f) + 0.02f*(acc_pitch - pitch_f);
+
+		if (pitch_f > 90)       pitch_f = 90;
+		else if (pitch_f < -90) pitch_f = -90;
+
+		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
+				s.ms, ax, ay, az, gx, gy, gz,
+				(int)(angle*100), (int)(pitch_f*100));
+
+			if (++lines >= 100) {           // once per second of data
+				if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
+				lines = 0;
+				sendStr("fill "); sendInt((int16_t)rb_max_fill);
+				sendStr(" drop "); sendInt((int16_t)rb_dropped); sendStr("\r\n");
+			}
+	  	}
+
+  }
+}
 
 /* USER CODE END 4 */
 
