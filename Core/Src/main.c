@@ -519,6 +519,8 @@ static volatile uint32_t imu_faults = 0;   // failed reads (sensor unplugged / a
 static volatile uint32_t imu_q_max = 0;    // worst backlog seen in each queue
 static volatile uint32_t log_q_max = 0;
 
+static TaskHandle_t imu_h, filter_h, sd_h;   // so sd_task can ask each task how much stack it used
+
 void debug_pin_init(void) {
   RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
   GPIOA->MODER &= ~(3 << 16);   // clear PA8's mode bits
@@ -620,9 +622,9 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   // Stack sizes are in words (4 bytes). Priorities on CubeMX's 0-55 scale:
   // sampling must never be late, SD writing is allowed to be late (the queues absorb it).
-  if (xTaskCreate(imu_task,    "imu",    256,  NULL, osPriorityHigh,        NULL) != pdPASS ||  // 40
-      xTaskCreate(filter_task, "filter", 512,  NULL, osPriorityAboveNormal, NULL) != pdPASS ||  // 32
-      xTaskCreate(sd_task,     "sd",     1024, NULL, osPriorityBelowNormal, NULL) != pdPASS)    // 16
+  if (xTaskCreate(imu_task,    "imu",    256,  NULL, osPriorityHigh,        &imu_h) != pdPASS ||  // 40
+      xTaskCreate(filter_task, "filter", 512,  NULL, osPriorityAboveNormal, &filter_h) != pdPASS ||  // 32
+      xTaskCreate(sd_task,     "sd",     1024, NULL, osPriorityBelowNormal, &sd_h) != pdPASS)    // 16
     sendStr("task create FAIL (out of heap?)\r\n");
   // heartbeat (defaultTask, created by CubeMX above) is Normal = 24
   /* USER CODE END RTOS_THREADS */
@@ -895,29 +897,58 @@ void filter_task(void *arg) {
   }
 }
 
-/* sd_task: write CSV rows; save + print stats once a second. Lowest priority:
-   if the SD card stalls, rows just pile up in log_q. */
+/* sd_task: write CSV rows. Once per second of TIME (not per 100 rows, so it
+   keeps reporting even if the sensor is gone): save the file and print stats.
+   Every 10 s also print how much stack each task never touched.
+   Lowest priority: if the SD card stalls, rows just pile up in log_q. */
 void sd_task(void *arg) {
   (void)arg;
   sendStr("tasks running\r\n");
-  uint16_t lines = 0;
+
+  // PA9 (Arduino D8) = HIGH while f_sync runs, for the logic analyzer
+  GPIOA->MODER &= ~(3 << 18);
+  GPIOA->MODER |=  (1 << 18);
+
+  TickType_t next_report = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+  uint8_t reports = 0;
   log_msg_t r;
 
   for (;;) {
-    xQueueReceive(log_q, &r, portMAX_DELAY);       // sleep until a row arrives
-    uint32_t n = uxQueueMessagesWaiting(log_q) + 1;
-    if (n > log_q_max) log_q_max = n;
+    // Wait for a row, but never past the next report time
+    int32_t wait = (int32_t)(next_report - xTaskGetTickCount());
+    if (wait < 0) wait = 0;
 
-    f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
-             r.ms, r.ax, r.ay, r.az, r.gx, r.gy, r.gz, r.roll_x100, r.pitch_x100);
+    if (xQueueReceive(log_q, &r, (TickType_t)wait) == pdPASS) {
+      uint32_t n = uxQueueMessagesWaiting(log_q) + 1;
+      if (n > log_q_max) log_q_max = n;
+      f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
+               r.ms, r.ax, r.ay, r.az, r.gx, r.gy, r.gz, r.roll_x100, r.pitch_x100);
+    }
 
-    if (++lines >= 100) {                          // once per second of data
-      if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
-      lines = 0;
+    if ((int32_t)(xTaskGetTickCount() - next_report) >= 0) {   // 1 s passed
+      next_report += pdMS_TO_TICKS(1000);
+
+      GPIOA->BSRR = (1 << 9);                      // D8 HIGH = saving
+      FRESULT fr = f_sync(&file);
+      GPIOA->BSRR = (1 << (9 + 16));               // D8 LOW
+      if (fr != FR_OK) sendStr("sync FAIL\r\n");
+
       sendStr("imuq ");  sendInt((int16_t)imu_q_max);
       sendStr(" logq "); sendInt((int16_t)log_q_max);
       sendStr(" drop "); sendInt((int16_t)imu_drops); sendStr("/"); sendInt((int16_t)log_drops);
       sendStr(" fault "); sendInt((int16_t)imu_faults); sendStr("\r\n");
+
+      if (++reports >= 10) {                       // every 10 s
+        reports = 0;
+        // "High-water mark" = the LEAST free stack a task has ever had, in words.
+        // Small number = that task came close to running out.
+        sendStr("stack free (words): imu ");  sendInt((int16_t)uxTaskGetStackHighWaterMark(imu_h));
+        sendStr(" filter ");                  sendInt((int16_t)uxTaskGetStackHighWaterMark(filter_h));
+        sendStr(" sd ");                      sendInt((int16_t)uxTaskGetStackHighWaterMark(sd_h));
+        sendStr(" hb ");                      sendInt((int16_t)uxTaskGetStackHighWaterMark((TaskHandle_t)defaultTaskHandle));
+        sendStr(" | heap min free (bytes): "); sendInt((int16_t)xPortGetMinimumEverFreeHeapSize());
+        sendStr("\r\n");
+      }
     }
   }
 }
