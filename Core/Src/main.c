@@ -620,11 +620,13 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // Stack sizes are in words (4 bytes). Priorities on CubeMX's 0-55 scale:
+  // Stack sizes are in words (4 bytes), sized from measured high-water marks
+  // (used: imu 44, filter 96, sd ~132 words) with 2.7-3.9x margin.
+  // Priorities on CubeMX's 0-55 scale:
   // sampling must never be late, SD writing is allowed to be late (the queues absorb it).
-  if (xTaskCreate(imu_task,    "imu",    256,  NULL, osPriorityHigh,        &imu_h) != pdPASS ||  // 40
-      xTaskCreate(filter_task, "filter", 512,  NULL, osPriorityAboveNormal, &filter_h) != pdPASS ||  // 32
-      xTaskCreate(sd_task,     "sd",     1024, NULL, osPriorityBelowNormal, &sd_h) != pdPASS)    // 16
+  if (xTaskCreate(imu_task,    "imu",    128,  NULL, osPriorityHigh,        &imu_h) != pdPASS ||  // 40
+      xTaskCreate(filter_task, "filter", 256,  NULL, osPriorityAboveNormal, &filter_h) != pdPASS ||  // 32
+      xTaskCreate(sd_task,     "sd",     512,  NULL, osPriorityBelowNormal, &sd_h) != pdPASS)    // 16
     sendStr("task create FAIL (out of heap?)\r\n");
   // heartbeat (defaultTask, created by CubeMX above) is Normal = 24
   /* USER CODE END RTOS_THREADS */

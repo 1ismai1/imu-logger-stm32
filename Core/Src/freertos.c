@@ -58,9 +58,16 @@ void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName);
 /* USER CODE BEGIN 4 */
 void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
-   /* Run time stack overflow checking is performed if
-   configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
-   called if a stack overflow is detected. */
+  /* FreeRTOS calls this when a task has run past the end of its stack.
+     Memory may already be corrupted, so: say which task, then stop dead
+     instead of carrying on with bad data. */
+  extern void sendStr(char *str);
+  (void)xTask;
+  taskDISABLE_INTERRUPTS();
+  sendStr("\r\n!!! STACK OVERFLOW in task: ");
+  sendStr((char *)pcTaskName);
+  sendStr("\r\n");
+  for (;;);
 }
 /* USER CODE END 4 */
 
