@@ -26,6 +26,7 @@
 #include "ff.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -69,7 +70,9 @@ static void MX_I2C1_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void logger_task(void *arg);
+void imu_task(void *arg);
+void filter_task(void *arg);
+void sd_task(void *arg);
 
 /* USER CODE END PFP */
 
@@ -492,60 +495,29 @@ uint8_t mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
     return 1;
 }
 
-/* ---------------- Ring buffer + TIM2 ISR ----------------*/
-/* Timer interrupt samples the IMU every 10 ms into the ring buffer.
-   Main loop drains it to the SD card whenever it has time.            */
+/* ---------------- Task messages + queues ----------------*/
+/* imu_task --[imu_q]--> filter_task --[log_q]--> sd_task --> SD card */
 typedef struct {
-	uint32_t ms;       // timestamp when sampled
-	uint8_t  raw[14];  // the burst read, untouched
-} sample_t;
+	uint32_t ms;        // tick when sampled
+	uint8_t  raw[14];   // the burst read, untouched
+	uint8_t  restart;   // 1 = first sample after (re)connecting: re-snap the filters
+} imu_msg_t;
 
-#define RB_SIZE 256              // must be a power of 2
-#define RB_MASK (RB_SIZE - 1)
+typedef struct {
+	uint32_t ms;
+	int16_t  ax, ay, az, gx, gy, gz;     // raw counts (gyro bias removed)
+	int16_t  roll_x100, pitch_x100;      // degrees x 100
+} log_msg_t;
 
-static sample_t rb[RB_SIZE];
-static volatile uint32_t rb_head = 0;      // only the ISR writes this
-static volatile uint32_t rb_tail = 0;      // only main writes this
-static volatile uint32_t rb_dropped = 0;   // samples lost because buffer was full
-static volatile uint32_t rb_max_fill = 0;  // worst backlog seen
-static volatile uint8_t  imu_fault = 0;    // ISR sets it, main fixes it
+static QueueHandle_t imu_q;   // 16 samples:  filter is fast, small cushion is enough
+static QueueHandle_t log_q;   // 64 rows = 0.64 s cushion for slow SD writes
 
-void TIM2_IRQHandler(void) {
-	if (TIM2->SR & (1 << 0)) {             // UIF: timer rolled over
-		TIM2->SR = ~(1u << 0);             // clear UIF only
-
-		if (imu_fault) return;             // main is fixing the sensor, hands off I2C
-		if (rb_head - rb_tail >= RB_SIZE) { rb_dropped++; return; }
-
-		GPIOA->BSRR = (1 << 8);            // debug pin HIGH = ISR running
-
-		sample_t *s = &rb[rb_head & RB_MASK];
-		s->ms = HAL_GetTick();
-		uint8_t *r = s->raw;
-		if (!mpu_read_burst(ACCEL_XOUT_H, r, 14) ||
-		    (r[0] | r[1] | r[2] | r[3] | r[4] | r[5]) == 0) {   // all-zero = sleeping sensor (Bug 17)
-			imu_fault = 1;
-			GPIOA->BSRR = (1 << (8 + 16));
-			return;
-		}
-
-		__DMB();                           // data fully written BEFORE head moves
-		rb_head++;
-
-		uint32_t fill = rb_head - rb_tail;
-		if (fill > rb_max_fill) rb_max_fill = fill;
-
-		GPIOA->BSRR = (1 << (8 + 16));     // debug pin LOW
-	}
-}
-
-static int rb_pop(sample_t *out) {
-	if (rb_head == rb_tail) return 0;      // empty
-	*out = rb[rb_tail & RB_MASK];
-	__DMB();                               // finish copying BEFORE tail moves
-	rb_tail++;
-	return 1;
-}
+// stats, printed once a second by sd_task
+static volatile uint32_t imu_drops = 0;    // imu_q was full, sample thrown away
+static volatile uint32_t log_drops = 0;    // log_q was full, row thrown away
+static volatile uint32_t imu_faults = 0;   // failed reads (sensor unplugged / asleep)
+static volatile uint32_t imu_q_max = 0;    // worst backlog seen in each queue
+static volatile uint32_t log_q_max = 0;
 
 void debug_pin_init(void) {
   RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
@@ -618,20 +590,6 @@ int main(void)
   if (r != FR_OK) { sendStr("NO LOG FILE - stopping\r\n"); while (1); }
   f_printf(&file, "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n");   // header row
 
-  /*------Timer Setup: started LAST, after everything else that uses I2C / takes time-----*/
-  RCC->APB1ENR |= (1 << 0);      // TIM2 clock on
-  TIM2->PSC  = 8400 - 1;         // 84 MHz timer clock / 8400 = 10 kHz
-  TIM2->ARR  = 100 - 1;          // 10 kHz / 100 = 100 Hz (every 10 ms)
-  TIM2->EGR  = (1 << 0);         // load PSC now (it's buffered)
-  TIM2->SR   = 0;                // EGR set UIF, clear it
-  TIM2->DIER |= (1 << 0);        // interrupt on rollover
-
-  // HAL's tick (TIM1) is priority 0, so HAL_GetTick() keeps counting inside this ISR.
-  // TIM2 calls no FreeRTOS functions, so it's allowed to be above FreeRTOS's limit (5).
-  NVIC_SetPriority(TIM2_IRQn, 1);
-  NVIC_EnableIRQ(TIM2_IRQn);
-  TIM2->CR1 |= (1 << 0);         // start
-
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -650,7 +608,9 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  imu_q = xQueueCreate(16, sizeof(imu_msg_t));
+  log_q = xQueueCreate(64, sizeof(log_msg_t));
+  if (!imu_q || !log_q) sendStr("queue create FAIL\r\n");
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -658,10 +618,13 @@ int main(void)
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // logger: 1024 words (4 KB) of stack, f_printf + float math need room.
-  // Priority: CubeMX's scale is 0-55. Heartbeat = Normal (24), logger = AboveNormal (32): data wins.
-  if (xTaskCreate(logger_task, "logger", 1024, NULL, osPriorityAboveNormal, NULL) != pdPASS)
-    sendStr("logger task create FAIL\r\n");
+  // Stack sizes are in words (4 bytes). Priorities on CubeMX's 0-55 scale:
+  // sampling must never be late, SD writing is allowed to be late (the queues absorb it).
+  if (xTaskCreate(imu_task,    "imu",    256,  NULL, osPriorityHigh,        NULL) != pdPASS ||  // 40
+      xTaskCreate(filter_task, "filter", 512,  NULL, osPriorityAboveNormal, NULL) != pdPASS ||  // 32
+      xTaskCreate(sd_task,     "sd",     1024, NULL, osPriorityBelowNormal, NULL) != pdPASS)    // 16
+    sendStr("task create FAIL (out of heap?)\r\n");
+  // heartbeat (defaultTask, created by CubeMX above) is Normal = 24
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -845,93 +808,117 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* Logger task: drains the ring buffer, runs the filters, writes the CSV. */
-void logger_task(void *arg) {
+/* ---------------- Tasks ---------------- */
+
+/* imu_task: read the MPU-6050 every 10 ms (100 Hz), hand the raw bytes on. */
+void imu_task(void *arg) {
   (void)arg;
-  sendStr("logger task running\r\n");
-  float angle = 0;
+  uint8_t restart = 1;
+  TickType_t last = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(10));   // wake exactly every 10 ms
+
+    imu_msg_t m;
+    GPIOA->BSRR = (1 << 8);                        // debug pin HIGH = reading
+    uint8_t ok = mpu_read_burst(ACCEL_XOUT_H, m.raw, 14) &&
+                 (m.raw[0] | m.raw[1] | m.raw[2] | m.raw[3] | m.raw[4] | m.raw[5]) != 0;  // all-zero = asleep (Bug 17)
+    GPIOA->BSRR = (1 << (8 + 16));                 // debug pin LOW
+
+    if (!ok) {                       // only this task touches I2C, so fix it right here
+      imu_faults++;
+      i2c1_init();                   // SWRST + reconfigure
+      mpu_init();                    // sensor still missing? next read fails, we retry in 10 ms
+      restart = 1;
+      continue;
+    }
+
+    m.ms = xTaskGetTickCount();
+    m.restart = restart;
+    restart = 0;
+    if (xQueueSend(imu_q, &m, 0) != pdPASS) imu_drops++;   // never wait: sampling can't be late
+  }
+}
+
+/* filter_task: raw bytes -> scaled values -> roll/pitch (complementary filter). */
+void filter_task(void *arg) {
+  (void)arg;
+  float angle = 0;     // filtered roll
   float pitch_f = 0;   // filtered pitch
-  uint8_t first = 1;   // 1 until the first loop pass is done
-  uint16_t lines = 0;  // lines written since the last save
+  imu_msg_t m;
 
-  while (1)
-  {
-	  	if (imu_fault) {
-	  		NVIC_DisableIRQ(TIM2_IRQn);     // ISR can't touch I2C while we fix it
-	  		i2c1_init();                    // SWRST + reconfigure
-	  		imu_fault = !mpu_init();        // stays 1 if sensor still missing -> retry next pass
-	  		first = 1;                      // re-snap filters to the accelerometer
-	  		NVIC_EnableIRQ(TIM2_IRQn);
-	  	}
+  for (;;) {
+    xQueueReceive(imu_q, &m, portMAX_DELAY);       // sleep until a sample arrives
+    uint32_t n = uxQueueMessagesWaiting(imu_q) + 1;
+    if (n > imu_q_max) imu_q_max = n;
 
+    uint8_t *raw = m.raw;
+    int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
+    int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
+    int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
+    int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
+    int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
+    int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-	  	sample_t s;
-	  	while (rb_pop(&s)) {
-	  		uint8_t *raw = s.raw;           // rest of the code below is unchanged
+    //subtracting gyroscope biases
+    gx -= -101;
+    gy -= -52;
+    gz -= -1;
 
-		int16_t ax = (int16_t)((raw[0]  << 8) | raw[1]);
-		int16_t ay = (int16_t)((raw[2]  << 8) | raw[3]);
-		int16_t az = (int16_t)((raw[4]  << 8) | raw[5]);
-		int16_t gx = (int16_t)((raw[8]  << 8) | raw[9]);
-		int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
-		int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
+    float ax_g = ax/4096.0f - 0.095f;
+    float ay_g = ay/4096.0f + 0.025f;
+    float az_g = az/4096.0f + 0.22f;
 
+    float acc_angle = atan2f(ay_g, az_g) * 57.2958f;
+    float acc_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
+    if (m.restart) {
+      angle   = acc_angle;   // start both filters at the true angle, not 0
+      pitch_f = acc_pitch;
+    }
+    float gx_dps = gx/16.4f;
+    float gy_dps = gy/16.4f;
 
-		//subtracting gyroscope biases
-		gx -= -101;
-		gy -= -52;
-		gz -= -1;
+    float error = acc_angle - angle;
+    if (error > 180)       error -= 360;
+    else if (error < -180) error += 360;
 
-		float ax_g = ax/4096.0f;
-		float ay_g = ay/4096.0f;
-		float az_g = az/4096.0f;
+    angle = (angle + gx_dps*0.01f) + 0.02f*error;
+    if (angle > 180)       angle -= 360;
+    else if (angle < -180) angle += 360;
+    pitch_f = (pitch_f + gy_dps*0.01f) + 0.02f*(acc_pitch - pitch_f);
+    if (pitch_f > 90)       pitch_f = 90;
+    else if (pitch_f < -90) pitch_f = -90;
 
-		ax_g -= 0.095f;
-		ay_g += 0.025f;
-		az_g += 0.22f;
+    log_msg_t row = { m.ms, ax, ay, az, gx, gy, gz,
+                      (int16_t)(angle*100), (int16_t)(pitch_f*100) };
+    if (xQueueSend(log_q, &row, 0) != pdPASS) log_drops++;
+  }
+}
 
-		float acc_angle = atan2f(ay_g, az_g) * 57.2958f;
-		float acc_pitch = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * 57.2958f;
-		if (first) {
-		    angle   = acc_angle;   // start both filters at the true angle, not 0
-		    pitch_f = acc_pitch;
-		    first   = 0;
-		}
-		float gx_dps = gx/16.4f;
-		float gy_dps = gy/16.4f;
+/* sd_task: write CSV rows; save + print stats once a second. Lowest priority:
+   if the SD card stalls, rows just pile up in log_q. */
+void sd_task(void *arg) {
+  (void)arg;
+  sendStr("tasks running\r\n");
+  uint16_t lines = 0;
+  log_msg_t r;
 
+  for (;;) {
+    xQueueReceive(log_q, &r, portMAX_DELAY);       // sleep until a row arrives
+    uint32_t n = uxQueueMessagesWaiting(log_q) + 1;
+    if (n > log_q_max) log_q_max = n;
 
-		float error = acc_angle - angle;
-		if (error > 180) {
-			error -= 360;
-		}
-		else if (error < -180) {
-			error += 360;
-		}
+    f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
+             r.ms, r.ax, r.ay, r.az, r.gx, r.gy, r.gz, r.roll_x100, r.pitch_x100);
 
-
-
-		angle = (angle + gx_dps*0.01f) + 0.02f*error;
-		if (angle > 180) angle -= 360;
-		else if (angle < -180) angle += 360;
-		pitch_f = (pitch_f + gy_dps*0.01f) + 0.02f*(acc_pitch - pitch_f);
-
-		if (pitch_f > 90)       pitch_f = 90;
-		else if (pitch_f < -90) pitch_f = -90;
-
-		f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
-				s.ms, ax, ay, az, gx, gy, gz,
-				(int)(angle*100), (int)(pitch_f*100));
-
-			if (++lines >= 100) {           // once per second of data
-				if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
-				lines = 0;
-				sendStr("fill "); sendInt((int16_t)rb_max_fill);
-				sendStr(" drop "); sendInt((int16_t)rb_dropped); sendStr("\r\n");
-			}
-	  	}
-
-	  	vTaskDelay(pdMS_TO_TICKS(10));   // buffer empty: sleep 10 ms so other tasks get the CPU
+    if (++lines >= 100) {                          // once per second of data
+      if (f_sync(&file) != FR_OK) sendStr("sync FAIL\r\n");
+      lines = 0;
+      sendStr("imuq ");  sendInt((int16_t)imu_q_max);
+      sendStr(" logq "); sendInt((int16_t)log_q_max);
+      sendStr(" drop "); sendInt((int16_t)imu_drops); sendStr("/"); sendInt((int16_t)log_drops);
+      sendStr(" fault "); sendInt((int16_t)imu_faults); sendStr("\r\n");
+    }
   }
 }
 
@@ -955,8 +942,8 @@ void StartDefaultTask(void *argument)
   for(;;)
   {
     on = !on;
-    // BSRR, not ODR ^= : a read-modify-write of ODR could be interrupted by the
-    // TIM2 ISR changing PA8, and we'd write PA8's old value back.
+    // BSRR, not ODR ^= : a read-modify-write of ODR could be interrupted by
+    // imu_task changing PA8, and we'd write PA8's old value back.
     GPIOA->BSRR = on ? (1 << 10) : (1 << (10 + 16));
     vTaskDelay(pdMS_TO_TICKS(250));
   }
