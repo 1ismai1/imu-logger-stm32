@@ -275,14 +275,14 @@ uint8_t spi_transfer(uint8_t b)
 	return SPI1->DR; // read data
 }
 
-/* ---------------- SPI1 TX DMA (DMA2 Stream5, Channel 3) ----------------
+/* ---------------- SPI1 TX DMA (DMA2 Stream3, Channel 3) ----------------
    Sends a whole block to the SD card while the CPU does other work.
    FROM = buf (moves forward), TO = SPI1->DR (stays put), HOW MANY = n.
    SPI1 raises a DMA request every time TXE = 1 ("ready for the next byte"),
    the DMA copies one byte, and when the count hits 0 it fires an interrupt. */
-#define SPI_DMA        DMA2_Stream5
-#define SPI_DMA_FLAGS  (DMA_HIFCR_CTCIF5 | DMA_HIFCR_CHTIF5 | DMA_HIFCR_CTEIF5 | \
-                        DMA_HIFCR_CDMEIF5 | DMA_HIFCR_CFEIF5)
+#define SPI_DMA        DMA2_Stream3          // (Stream5 is kept free for USART1_RX -> ESP32 link later)
+#define SPI_DMA_FLAGS  (DMA_LIFCR_CTCIF3 | DMA_LIFCR_CHTIF3 | DMA_LIFCR_CTEIF3 | \
+                        DMA_LIFCR_CDMEIF3 | DMA_LIFCR_CFEIF3)
 
 static TaskHandle_t     spi_dma_waiter = NULL;   // task sleeping until the block is sent
 static volatile uint8_t spi_dma_err    = 0;
@@ -301,16 +301,16 @@ void spi1_dma_init(void) {
 
   // Priority 6: numerically >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5),
   // otherwise the handler is NOT allowed to call FreeRTOS ...FromISR functions.
-  NVIC_SetPriority(DMA2_Stream5_IRQn, 6);
-  NVIC_EnableIRQ(DMA2_Stream5_IRQn);
+  NVIC_SetPriority(DMA2_Stream3_IRQn, 6);
+  NVIC_EnableIRQ(DMA2_Stream3_IRQn);
 }
 
 /* Runs when the DMA finishes (or hits an error): wake the task that started it. */
-void DMA2_Stream5_IRQHandler(void) {
+void DMA2_Stream3_IRQHandler(void) {
   BaseType_t woke = pdFALSE;
-  uint32_t isr = DMA2->HISR;
-  DMA2->HIFCR = SPI_DMA_FLAGS;                  // clear this stream's flags
-  if (isr & DMA_HISR_TEIF5) spi_dma_err = 1;
+  uint32_t isr = DMA2->LISR;                    // streams 0-3 report in LISR, 4-7 in HISR
+  DMA2->LIFCR = SPI_DMA_FLAGS;                  // clear this stream's flags
+  if (isr & DMA_LISR_TEIF3) spi_dma_err = 1;
   if (spi_dma_waiter) vTaskNotifyGiveFromISR(spi_dma_waiter, &woke);
   portYIELD_FROM_ISR(woke);                     // switch straight to it if it outranks us
 }
@@ -323,7 +323,7 @@ uint8_t spi1_dma_send(const uint8_t *buf, uint16_t n) {
   uint8_t ok = 1;
 
   while (!(SPI1->SR & SPI_SR_TXE));             // last polled byte handed over
-  DMA2->HIFCR   = SPI_DMA_FLAGS;
+  DMA2->LIFCR   = SPI_DMA_FLAGS;
   SPI_DMA->M0AR = (uint32_t)buf;                // FROM
   SPI_DMA->NDTR = n;                            // HOW MANY
   spi_dma_err   = 0;
@@ -345,9 +345,9 @@ uint8_t spi1_dma_send(const uint8_t *buf, uint16_t n) {
     if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20)) == 0) ok = 0;
   } else {
     uint32_t t = 2000000;
-    while (!(DMA2->HISR & (DMA_HISR_TCIF5 | DMA_HISR_TEIF5)) && --t);
-    if (!(DMA2->HISR & DMA_HISR_TCIF5)) ok = 0;
-    DMA2->HIFCR = SPI_DMA_FLAGS;
+    while (!(DMA2->LISR & (DMA_LISR_TCIF3 | DMA_LISR_TEIF3)) && --t);
+    if (!(DMA2->LISR & DMA_LISR_TCIF3)) ok = 0;
+    DMA2->LIFCR = SPI_DMA_FLAGS;
   }
   if (spi_dma_err) ok = 0;
   spi_dma_waiter = NULL;
@@ -529,8 +529,16 @@ uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
 #define WHO_AM_I  0x75
 #define PWR_MGMT_1  0x6B
 #define ACCEL_XOUT_H 0x3B
+#define MPU_CONFIG  0x1A    // DLPF_CFG in bits 2:0 (the sensor's built-in low-pass filter)
 #define GYRO_CONFIG 0x1B
 #define ACCEL_CONFIG 0x1C
+
+/* DLPF_CFG = 3: accel 44 Hz / gyro 42 Hz bandwidth, ~4.8 ms delay.
+   We sample at 100 Hz, so anything above 50 Hz (motor/prop vibration on a drone)
+   would alias - fold down and show up as a fake slow wobble. Cutting it off
+   inside the sensor, before we sample, is the only place it can be removed.
+   Side effect: the gyro's internal rate drops from 8 kHz to 1 kHz (still 10x ours). */
+#define MPU_DLPF_44HZ 0x03
 
 void mpu_probe(void) {
 	uint32_t t;
@@ -577,6 +585,7 @@ uint8_t mpu_write_reg(uint8_t reg, uint8_t val) {
 
 uint8_t mpu_init(void) {
     return mpu_write_reg(PWR_MGMT_1, 0x01) &&
+           mpu_write_reg(MPU_CONFIG, MPU_DLPF_44HZ) &&   // vibration filter (also re-applied after a reconnect)
            mpu_write_reg(ACCEL_CONFIG, 0x10) &&
            mpu_write_reg(GYRO_CONFIG, 0x18);
 }
@@ -731,6 +740,19 @@ static QueueHandle_t full_q;   // full blocks  (writer takes from here)
 static volatile uint32_t blocks_written = 0;
 static volatile uint32_t blk_waits = 0;    // formatter had to wait for an empty block (writer too slow)
 static volatile uint32_t sd_errors = 0;    // failed f_write / f_sync
+
+/* ---------------- Gyro bias, measured at power-on ----------------
+   A still gyro should read 0, but each one has an offset (bias) that changes
+   with temperature, so hard-coded numbers go stale. filter_task averages the
+   first 2 s of samples. If the board moved during that window (any axis swung
+   more than GYRO_CAL_MAX_SPAN counts), it tries again; after 5 tries it keeps
+   the old hand-measured values. Logging runs normally the whole time. */
+#define GYRO_CAL_SAMPLES   200   // 2 s at 100 Hz
+#define GYRO_CAL_MAX_SPAN  50    // counts, ~3 deg/s at 16.4 counts per deg/s
+#define GYRO_CAL_TRIES     5
+
+static volatile int16_t gyro_bias[3] = { -101, -52, -1 };   // fallback: the old hard-coded values
+static volatile uint8_t gyro_cal_state = 0;   // 0 = measuring, 1 = measured, 2 = kept moving -> fallback
 
 static TaskHandle_t imu_h, filter_h, sd_h, sdw_h;   // so sd_task can ask each task how much stack it used
 
@@ -1075,6 +1097,12 @@ void filter_task(void *arg) {
   float pitch_f = 0;   // filtered pitch
   imu_msg_t m;
 
+  // gyro bias calibration window
+  int32_t  cal_sum[3] = {0, 0, 0};
+  int16_t  cal_min[3] = {0, 0, 0}, cal_max[3] = {0, 0, 0};
+  uint16_t cal_n = 0;
+  uint8_t  cal_tries = 0;
+
   for (;;) {
     xQueueReceive(imu_q, &m, portMAX_DELAY);       // sleep until a sample arrives
     uint32_t n = uxQueueMessagesWaiting(imu_q) + 1;
@@ -1088,10 +1116,38 @@ void filter_task(void *arg) {
     int16_t gy = (int16_t)((raw[10] << 8) | raw[11]);
     int16_t gz = (int16_t)((raw[12] << 8) | raw[13]);
 
-    //subtracting gyroscope biases
-    gx -= -101;
-    gy -= -52;
-    gz -= -1;
+    // Calibrating: collect raw gyro readings (before any bias is removed)
+    if (gyro_cal_state == 0) {
+      int16_t g[3] = { gx, gy, gz };
+      if (m.restart) cal_n = 0;                    // sensor just (re)connected: start the window over
+      for (int k = 0; k < 3; k++) {
+        if (cal_n == 0) { cal_sum[k] = 0; cal_min[k] = cal_max[k] = g[k]; }
+        cal_sum[k] += g[k];
+        if (g[k] < cal_min[k]) cal_min[k] = g[k];
+        if (g[k] > cal_max[k]) cal_max[k] = g[k];
+      }
+      if (++cal_n == GYRO_CAL_SAMPLES) {
+        uint8_t still = 1;
+        for (int k = 0; k < 3; k++)
+          if (cal_max[k] - cal_min[k] > GYRO_CAL_MAX_SPAN) still = 0;
+
+        if (still) {
+          for (int k = 0; k < 3; k++) {            // average, rounded to the nearest count
+            int32_t s = cal_sum[k];
+            gyro_bias[k] = (int16_t)((s >= 0 ? s + GYRO_CAL_SAMPLES/2 : s - GYRO_CAL_SAMPLES/2) / GYRO_CAL_SAMPLES);
+          }
+          gyro_cal_state = 1;
+        } else if (++cal_tries >= GYRO_CAL_TRIES) {
+          gyro_cal_state = 2;                      // never held still: keep the fallback values
+        }
+        cal_n = 0;                                 // (if moved, the next window starts now)
+      }
+    }
+
+    // subtract gyroscope bias (fallback values until calibration finishes)
+    gx -= gyro_bias[0];
+    gy -= gyro_bias[1];
+    gz -= gyro_bias[2];
 
     float ax_g = ax/4096.0f - 0.095f;
     float ay_g = ay/4096.0f + 0.025f;
@@ -1175,6 +1231,7 @@ void sd_task(void *arg) {
 
   TickType_t next_report = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
   uint8_t reports = 0;
+  uint8_t cal_reported = 0;
   log_msg_t r;
   char line[80];   // longest row is ~75 chars
 
@@ -1205,6 +1262,13 @@ void sd_task(void *arg) {
       sendStr(" blk ");  sendU32(blocks_written);
       sendStr(" wait "); sendU32(blk_waits);
       sendStr(" sderr "); sendU32(sd_errors); sendStr("\r\n");
+
+      if (!cal_reported && gyro_cal_state != 0) {  // once, when calibration ends
+        cal_reported = 1;
+        sendStr(gyro_cal_state == 1 ? "gyro bias measured: " : "gyro moved during calibration, using defaults: ");
+        sendInt(gyro_bias[0]); sendStr(" "); sendInt(gyro_bias[1]); sendStr(" "); sendInt(gyro_bias[2]);
+        sendStr("\r\n");
+      }
 
       if (++reports >= 10) {                       // every 10 s
         reports = 0;
