@@ -11,11 +11,13 @@ Taps swing the raw accelerometer angle by ±150°, while the filtered angle bare
 ## Features
 
 - **Four FreeRTOS tasks**, joined by queues. Sampling, filtering, CSV formatting and SD writing run separately, ranked by how urgent they are (see Architecture).
-- **DMA on both buses** (register level). I2C1 → DMA1 Stream 5 for the 14-byte sensor read, DMA2 Stream 5 → SPI1 for SD card blocks. The task starts the transfer and sleeps; the DMA-complete interrupt wakes it with a FreeRTOS task notification. No polling loops in the data path.
+- **DMA on both buses** (register level). I2C1 → DMA1 Stream 5 for the 14-byte sensor read, DMA2 Stream 3 → SPI1 for SD card blocks. The task starts the transfer and sleeps; the DMA-complete interrupt wakes it with a FreeRTOS task notification. No polling loops in the data path.
 - **Ping-pong (double) buffering** for the SD card: one 512-byte block is filled with CSV text while the other is being written. The blocks are swapped by passing an index through a queue, never copied.
 - **100 Hz sampling with no drift.** `vTaskDelayUntil` wakes the sensor task exactly every 10 ms. In a 98 s test log, **8,297 of 8,299 sample gaps were exactly 10 ms**, with zero samples dropped.
 - **Burst read** of all 14 MPU-6050 data bytes in one I2C transaction, so every axis comes from the same instant.
 - **Complementary filter** for roll and pitch: the gyro is trusted short-term, the accelerometer long-term. It starts at the accelerometer angle, so there is no warm-up.
+- **Vibration filter in the sensor.** The MPU-6050's digital low-pass filter is set to 44 Hz (accel) / 42 Hz (gyro). Sampling at 100 Hz can only represent motion below 50 Hz; faster vibration (motors, props) would otherwise alias into a fake slow wobble. It has to be filtered before sampling, so it's done inside the sensor.
+- **Gyro bias measured at power-on.** The first 2 s of samples are averaged to find each axis's zero-rate offset, which drifts with temperature. If the board moves during that window (any axis swings more than ~3 °/s) it tries again, up to 5 times, then falls back to stored values. Logging runs the whole time. First run measured −92 / −47 / −11 counts against the old hard-coded −101 / −52 / −1: a 0.3–0.6 °/s difference that would have drifted a gyro-only angle by ~20–35° per minute.
 - **CSV logging to microSD** (exFAT). Each boot creates a new `LOGnnn.CSV`. Data goes to the card in 512-byte blocks, and the file is saved once per second, so a power cut loses about the last second of data.
 - **Fault recovery.** Every I2C wait has a timeout. If a sensor wire comes loose or the sensor loses power, the logger re-initialises it and keeps going, leaving a visible gap in the timestamps.
 - **Live health stats** over the serial port every second (queue backlog, dropped samples, sensor faults), plus each task's stack usage every 10 s.
@@ -69,7 +71,7 @@ A DMA stream is a small copier that runs beside the CPU. It needs three things: 
 
 | | Sensor read | SD block write |
 |---|---|---|
-| Stream | DMA1 Stream 5, channel 1 (I2C1_RX) | DMA2 Stream 5, channel 3 (SPI1_TX) |
+| Stream | DMA1 Stream 5, channel 1 (I2C1_RX) | DMA2 Stream 3, channel 3 (SPI1_TX) |
 | From → to | `I2C1->DR` → `buf` | `blk[i]` → `SPI1->DR` |
 | Address increment | memory only (`MINC`), never the peripheral | memory only (`MINC`) |
 | Per-byte trigger | I2C1 sees `RXNE` (byte arrived) | SPI1 sees `TXE` (ready for next byte) |
@@ -178,6 +180,7 @@ file LOG040.CSV open 0
 tasks running
 imuq 1 logq 1 drop 0/0 fault 0 blk 9 wait 0 sderr 0
 imuq 1 logq 1 drop 0/0 fault 0 blk 19 wait 0 sderr 0
+gyro bias measured: -92 -47 -11
 ...
 stack free (words): imu 84 filter 160 sd 178 sdw 265 hb 100 | heap min free (bytes): 8216
 ```
