@@ -2,7 +2,7 @@
 
 A motion logger built on an STM32F411 (NUCLEO-F411RE). It reads an MPU-6050 accelerometer and gyroscope over I2C, combines them into roll and pitch angles with a complementary filter, and saves 100 samples per second to a microSD card as CSV files.
 
-Every peripheral driver (GPIO, UART, I2C, SPI and the SD card protocol) is written **at the register level**, straight from the STM32 reference manual (RM0383). There is no ST HAL in the data path. The firmware runs as **three FreeRTOS tasks joined by queues**, so a slow SD card can never delay a sensor reading. The only libraries are [FreeRTOS](https://www.freertos.org/) and [FatFS](http://elm-chan.org/fsw/ff/) (connected through my own `diskio.c`).
+Every peripheral driver (GPIO, UART, I2C, SPI and the SD card protocol) is written **at the register level**, straight from the STM32 reference manual (RM0383). There is no ST HAL in the data path. The firmware runs as **four FreeRTOS tasks joined by queues**, so a slow SD card can never delay a sensor reading, and both data paths use **DMA**: the CPU sleeps while the sensor bytes come in and while each 512-byte block goes out to the card. The only libraries are [FreeRTOS](https://www.freertos.org/) and [FatFS](http://elm-chan.org/fsw/ff/) (connected through my own `diskio.c`).
 
 ![Accelerometer vs gyro vs complementary filter](docs/filter_demo.png)
 
@@ -10,11 +10,13 @@ Taps swing the raw accelerometer angle by ±150°, while the filtered angle bare
 
 ## Features
 
-- **Three FreeRTOS tasks**, joined by two queues. Sampling, filtering and SD writing run separately, ranked by how urgent they are (see Architecture).
+- **Four FreeRTOS tasks**, joined by queues. Sampling, filtering, CSV formatting and SD writing run separately, ranked by how urgent they are (see Architecture).
+- **DMA on both buses** (register level). I2C1 → DMA1 Stream 5 for the 14-byte sensor read, DMA2 Stream 5 → SPI1 for SD card blocks. The task starts the transfer and sleeps; the DMA-complete interrupt wakes it with a FreeRTOS task notification. No polling loops in the data path.
+- **Ping-pong (double) buffering** for the SD card: one 512-byte block is filled with CSV text while the other is being written. The blocks are swapped by passing an index through a queue, never copied.
 - **100 Hz sampling with no drift.** `vTaskDelayUntil` wakes the sensor task exactly every 10 ms. In a 98 s test log, **8,297 of 8,299 sample gaps were exactly 10 ms**, with zero samples dropped.
 - **Burst read** of all 14 MPU-6050 data bytes in one I2C transaction, so every axis comes from the same instant.
 - **Complementary filter** for roll and pitch: the gyro is trusted short-term, the accelerometer long-term. It starts at the accelerometer angle, so there is no warm-up.
-- **CSV logging to microSD** (exFAT). Each boot creates a new `LOGnnn.CSV`, and the file is saved to the card once per second, so a power cut loses at most 1 s of data.
+- **CSV logging to microSD** (exFAT). Each boot creates a new `LOGnnn.CSV`. Data goes to the card in 512-byte blocks, and the file is saved once per second, so a power cut loses about the last second of data.
 - **Fault recovery.** Every I2C wait has a timeout. If a sensor wire comes loose or the sensor loses power, the logger re-initialises it and keeps going, leaving a visible gap in the timestamps.
 - **Live health stats** over the serial port every second (queue backlog, dropped samples, sensor faults), plus each task's stack usage every 10 s.
 - **Stack overflow detection.** If any task runs past the end of its stack, the board prints the task's name and halts, instead of silently corrupting memory.
@@ -24,9 +26,10 @@ Taps swing the raw accelerometer angle by ±150°, while the filtered angle bare
 ## Architecture
 
 ```
-imu_task ──[imu_q, 16]──▶ filter_task ──[log_q, 64]──▶ sd_task ──▶ microSD
- prio 40                     prio 32                     prio 16
- never waits                 never waits                 allowed to be slow
+imu_task ──[imu_q, 16]──▶ filter_task ──[log_q, 64]──▶ sd_task ──[full_q]──▶ sdw_task ──▶ microSD
+ prio 40                     prio 32                   prio 16  ◀──[free_q]──  prio 8
+ never waits                 never waits               formatter               writer
+ I2C via DMA                                           (ping-pong blocks)      SPI via DMA
 ```
 
 | Task | Priority | Job | Sleeps until |
@@ -34,7 +37,8 @@ imu_task ──[imu_q, 16]──▶ filter_task ──[log_q, 64]──▶ sd_ta
 | `imu_task` | 40 (highest) | Burst-reads the MPU-6050. Re-initialises the sensor itself if a read fails | The next 10 ms slot (`vTaskDelayUntil`) |
 | `filter_task` | 32 | Raw bytes → g, °/s, roll and pitch | A sample arrives in `imu_q` |
 | heartbeat | 24 | Toggles a pin every 250 ms, to show the scheduler is alive | 250 ms pass |
-| `sd_task` | 16 (lowest) | Writes CSV rows. Saves and prints stats every 1 s | A row arrives in `log_q`, or the next report is due |
+| `sd_task` | 16 | Formats rows as CSV text into the current 512-byte block. Hands full blocks to the writer. Prints stats every 1 s | A row arrives in `log_q`, or the next report is due |
+| `sdw_task` | 8 (lowest) | The only task that touches FatFS/SPI. Writes each full block (SPI DMA reads straight from the block), returns it as empty, saves the file every 1 s | A full block arrives in `full_q`, or the next save is due |
 
 **Design rules:**
 
@@ -42,6 +46,8 @@ imu_task ──[imu_q, 16]──▶ filter_task ──[log_q, 64]──▶ sd_ta
 - **Receivers wait forever** (`portMAX_DELAY`), so an idle task uses no CPU.
 - **Only `imu_task` touches I2C.** It can reset the bus after a failed read with no locking, because nothing else can be mid-transfer.
 - **SD writing is lowest priority.** When the card stalls, rows pile up in the 64-slot `log_q` (0.64 s of cushion) instead of delaying samples.
+- **Only `sdw_task` touches FatFS and SPI**, for the same reason.
+- **Every file write is a whole, aligned 512-byte block** (the CSV header goes into the first block instead of being written on its own). That lets FatFS pass our buffer straight to `disk_write`, so the DMA reads from it directly with no extra copy.
 
 ### Stack sizing, from measurement
 
@@ -52,9 +58,30 @@ Each task gets a fixed block of RAM for its stack. The first sizes were guesses.
 | `imu_task` | 256 | 44 | **128** | 2.9× |
 | `filter_task` | 512 | 96 | **256** | 2.7× |
 | `sd_task` | 1024 | ~132 | **512** | 3.9×, extra because the SD card's heaviest path may not have run during the test |
+| `sd_task` / `sdw_task` (after the DMA split) | — / 512 | 78 / 119 | **256 / 384** | 3.3× / 3.2× |
 | heartbeat | 128 | 28 | 128 | 4.6× |
 
 The guesses were 4–8× too big. Resizing freed **3.5 KB**: the FreeRTOS heap's minimum free space went from 5,440 B to **9,024 B**, matching the prediction exactly. `configCHECK_FOR_STACK_OVERFLOW = 2` catches overflows at runtime.
+
+## DMA: how the transfers work
+
+A DMA stream is a small copier that runs beside the CPU. It needs three things: **from**, **to**, and **how many**. The peripheral tells it *when* to copy each byte, and it raises an interrupt when the count reaches 0.
+
+| | Sensor read | SD block write |
+|---|---|---|
+| Stream | DMA1 Stream 5, channel 1 (I2C1_RX) | DMA2 Stream 5, channel 3 (SPI1_TX) |
+| From → to | `I2C1->DR` → `buf` | `blk[i]` → `SPI1->DR` |
+| Address increment | memory only (`MINC`), never the peripheral | memory only (`MINC`) |
+| Per-byte trigger | I2C1 sees `RXNE` (byte arrived) | SPI1 sees `TXE` (ready for next byte) |
+| When done | ISR sends STOP, wakes `imu_task` | ISR wakes `sdw_task` |
+
+Details that matter:
+
+- **Sensor read:** the CPU still sends the register address (1 byte). Then `DMAEN` + `LAST` are set in `I2C1->CR2`. `LAST` makes the hardware NACK the final byte by itself, replacing the hand-timed BTF/ACK-off sequence of the polling version. STOP is issued in the DMA-complete interrupt. The I2C stream runs at *very high* DMA priority, because ST's errata warns the I2C DMA request must be served before the next byte arrives.
+- **SD write:** "DMA done" means the last byte reached SPI1, not that it left the pin, so the driver then waits for `TXE`=1 and `BSY`=0. SPI receives a byte for every byte it sends; nobody reads those 512 replies, so `RXNE` and `OVR` are set afterwards and are cleared by reading `DR` then `SR`.
+- **Before the scheduler starts** (`f_mount`, `f_open`) there are no tasks to wake, so `spi1_dma_send` turns the interrupt off and polls the DMA flag instead.
+- **Interrupt priority 6.** A handler may only call FreeRTOS `...FromISR` functions if its priority number is ≥ `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (5).
+- **Card busy time:** after a block, the card holds MISO low while it programs flash (usually ~1 ms, sometimes 100+ ms). The writer spins for ~0.15 ms, then sleeps 1 ms between checks instead of burning the CPU.
 
 ## Verified with a logic analyzer
 
@@ -141,19 +168,19 @@ ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100
 | `gx gy gz` | Raw gyro counts with bias removed: 16.4 counts = 1 °/s |
 | `roll_x100`, `pitch_x100` | Filtered angles × 100 (4523 means 45.23°) |
 
-Angles are stored as integers × 100 because FatFS's `f_printf` can't print floats.
+Angles are stored as integers × 100, which keeps the CSV formatter a tiny integer-to-text routine (no floats, no `printf`).
 
 ## Serial output
 
 ```
 file LOG040.CSV open 0
 tasks running
-imuq 1 logq 1 drop 0/0 fault 0
+imuq 1 logq 1 drop 0/0 fault 0 blk 9 wait 0 sderr 0
 ...
-stack free (words): imu 84 filter 160 sd 382 hb 100 | heap min free (bytes): 9024
+stack free (words): imu ... filter ... sd ... sdw ... hb ... | heap min free (bytes): ...
 ```
 
-`imuq` / `logq` are the worst backlog seen in each queue, `drop` counts samples/rows thrown away because a queue was full, and `fault` counts failed sensor reads.
+`imuq` / `logq` are the worst backlog seen in each queue, `drop` counts samples/rows thrown away because a queue was full, and `fault` counts failed sensor reads. `blk` is how many 512-byte blocks have been written, `wait` counts times the formatter found both blocks busy (the writer fell behind), and `sderr` counts failed writes/saves.
 
 ## Build and run
 
@@ -185,7 +212,6 @@ Every real bug is written up with its symptom, root cause, fix and lesson. Some 
 
 ## Limitations
 
-- **The sensor task busy-waits on I2C** for about 1.55 ms per read, roughly 15% of the CPU spent waiting. DMA is next.
 - **No yaw (heading).** Correcting it needs a magnetometer, which the MPU-6050 doesn't have.
 - **Roll and pitch use separate filters**, so they break down near straight up or down and during full flips. Pitch is clamped to ±90°. A quaternion filter would fix this.
 - **A card interrupted mid-write can stay stuck until it is power-cycled.** Firmware can't recover it, so the planned PCB adds a switch on the card's power.
@@ -194,7 +220,6 @@ Every real bug is written up with its symptom, root cause, fix and lesson. Some 
 
 ## Roadmap
 
-- **DMA** for the I2C read, freeing the ~1.5 ms the CPU currently spends waiting on it
 - **Custom shield PCB** that plugs onto the Nucleo, replacing the jumper wires, with a GPIO-controlled power switch for the SD card and a socket for an ESP32-C6 radio
 - **Over-the-air firmware updates** through the ESP32-C6 (Wi-Fi), then mounting the logger on a drone
 - **Quaternion orientation filter**

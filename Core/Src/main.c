@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
+#include <string.h>
 #include "ff.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -73,6 +74,7 @@ void StartDefaultTask(void *argument);
 void imu_task(void *arg);
 void filter_task(void *arg);
 void sd_task(void *arg);
+void sdw_task(void *arg);
 
 /* USER CODE END PFP */
 
@@ -151,6 +153,14 @@ void sendHex(uint8_t b) {
 	char hex[] ="0123456789ABCDEF";
 	sendChar(hex[b >> 4]);
 	sendChar(hex[b & 0x0F]);
+}
+
+void sendU32(uint32_t u) {          // sendInt tops out at 32767, counters can go higher
+	char buf[11];
+	int i = 10;
+	buf[i] = '\0';
+	do { buf[--i] = '0' + (u % 10); u /= 10; } while (u);
+	sendStr(&buf[i]);
 }
 
 /* ---------------- I2C1 ---------------- */
@@ -263,6 +273,98 @@ uint8_t spi_transfer(uint8_t b)
 	SPI1->DR = b;
 	while(!(SPI1->SR & (1 << 0))); // waiting to receive bite
 	return SPI1->DR; // read data
+}
+
+/* ---------------- SPI1 TX DMA (DMA2 Stream5, Channel 3) ----------------
+   Sends a whole block to the SD card while the CPU does other work.
+   FROM = buf (moves forward), TO = SPI1->DR (stays put), HOW MANY = n.
+   SPI1 raises a DMA request every time TXE = 1 ("ready for the next byte"),
+   the DMA copies one byte, and when the count hits 0 it fires an interrupt. */
+#define SPI_DMA        DMA2_Stream5
+#define SPI_DMA_FLAGS  (DMA_HIFCR_CTCIF5 | DMA_HIFCR_CHTIF5 | DMA_HIFCR_CTEIF5 | \
+                        DMA_HIFCR_CDMEIF5 | DMA_HIFCR_CFEIF5)
+
+static TaskHandle_t     spi_dma_waiter = NULL;   // task sleeping until the block is sent
+static volatile uint8_t spi_dma_err    = 0;
+
+void spi1_dma_init(void) {
+  RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;           // DMA2 clock on
+  SPI_DMA->CR &= ~DMA_SxCR_EN;
+  while (SPI_DMA->CR & DMA_SxCR_EN);            // stream must be fully off before setup
+
+  SPI_DMA->PAR = (uint32_t)&SPI1->DR;           // TO: SPI data register (fixed)
+  SPI_DMA->CR  = (3 << 25)                      // CHSEL = 3 -> this stream listens to SPI1_TX
+               | (2 << 16)                      // PL = high priority
+               | DMA_SxCR_MINC                  // memory side moves forward (PINC stays off!)
+               | (1 << 6);                      // DIR = 01: memory -> peripheral
+                                                // sizes = bytes, FIFO off (direct mode)
+
+  // Priority 6: numerically >= configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY (5),
+  // otherwise the handler is NOT allowed to call FreeRTOS ...FromISR functions.
+  NVIC_SetPriority(DMA2_Stream5_IRQn, 6);
+  NVIC_EnableIRQ(DMA2_Stream5_IRQn);
+}
+
+/* Runs when the DMA finishes (or hits an error): wake the task that started it. */
+void DMA2_Stream5_IRQHandler(void) {
+  BaseType_t woke = pdFALSE;
+  uint32_t isr = DMA2->HISR;
+  DMA2->HIFCR = SPI_DMA_FLAGS;                  // clear this stream's flags
+  if (isr & DMA_HISR_TEIF5) spi_dma_err = 1;
+  if (spi_dma_waiter) vTaskNotifyGiveFromISR(spi_dma_waiter, &woke);
+  portYIELD_FROM_ISR(woke);                     // switch straight to it if it outranks us
+}
+
+/* Send n bytes with DMA. Returns 1 = ok, 0 = timeout/error.
+   Inside a task: the task SLEEPS until the DMA interrupt wakes it.
+   Before the scheduler starts (f_mount etc.): no tasks yet, so just poll the flag. */
+uint8_t spi1_dma_send(const uint8_t *buf, uint16_t n) {
+  uint8_t in_task = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
+  uint8_t ok = 1;
+
+  while (!(SPI1->SR & SPI_SR_TXE));             // last polled byte handed over
+  DMA2->HIFCR   = SPI_DMA_FLAGS;
+  SPI_DMA->M0AR = (uint32_t)buf;                // FROM
+  SPI_DMA->NDTR = n;                            // HOW MANY
+  spi_dma_err   = 0;
+
+  if (in_task) {
+    ulTaskNotifyTake(pdTRUE, 0);                // throw away any stale wake-up
+    spi_dma_waiter = xTaskGetCurrentTaskHandle();
+    SPI_DMA->CR |=  (DMA_SxCR_TCIE | DMA_SxCR_TEIE);
+  } else {
+    spi_dma_waiter = NULL;
+    SPI_DMA->CR &= ~(DMA_SxCR_TCIE | DMA_SxCR_TEIE);   // no interrupt: we poll TCIF ourselves
+  }
+
+  SPI_DMA->CR |= DMA_SxCR_EN;                   // copier armed...
+  SPI1->CR2   |= SPI_CR2_TXDMAEN;               // ...and SPI1 may now request bytes
+
+  if (in_task) {
+    // 512 bytes at 10.5 MHz ~ 0.4 ms. Sleep; other tasks get the CPU.
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20)) == 0) ok = 0;
+  } else {
+    uint32_t t = 2000000;
+    while (!(DMA2->HISR & (DMA_HISR_TCIF5 | DMA_HISR_TEIF5)) && --t);
+    if (!(DMA2->HISR & DMA_HISR_TCIF5)) ok = 0;
+    DMA2->HIFCR = SPI_DMA_FLAGS;
+  }
+  if (spi_dma_err) ok = 0;
+  spi_dma_waiter = NULL;
+
+  SPI1->CR2   &= ~SPI_CR2_TXDMAEN;
+  SPI_DMA->CR &= ~DMA_SxCR_EN;
+  while (SPI_DMA->CR & DMA_SxCR_EN);
+
+  // "DMA done" only means the last byte was handed to SPI1, not that it left the pin.
+  while (!(SPI1->SR & SPI_SR_TXE));
+  while (SPI1->SR & SPI_SR_BSY);
+
+  // SPI receives a byte for every byte it sends. Nobody read those 512 replies,
+  // so RXNE and OVR (overrun) are set. Clear them: read DR, then read SR.
+  (void)SPI1->DR;
+  (void)SPI1->SR;
+  return ok;
 }
 
 /* ---------------- SD card reader ---------------- */
@@ -386,28 +488,36 @@ uint8_t sd_read_block(uint32_t block, uint8_t *buf)
 	return 0;
 }
 
-uint8_t sd_write_block(uint32_t block, uint8_t *buf)
+uint8_t sd_write_block(uint32_t block, const uint8_t *buf)
 {
 	uint8_t r = sd_send_cmd(24, block, 0x01);
 	if (r != 0) {sd_deselect(); return 1; }
 
 	spi_transfer(0xFF);
-	spi_transfer(0xFE);
+	spi_transfer(0xFE);                             // start token
 
-	for (int i = 0; i < 512; i++) spi_transfer(buf[i]); // the data being sent
+	if (!spi1_dma_send(buf, 512)) { sd_deselect(); return 4; }   // the 512 data bytes, by DMA
 
-	spi_transfer(0xFF);
+	spi_transfer(0xFF);                             // CRC (ignored in SPI mode)
 	spi_transfer(0xFF);
 	for (int k = 0; k < 10; k++) {
 	    r = spi_transfer(0xFF);
 	    if (r != 0xFF) break;
 	}
 
-	if ((r & 0x1F) != 0x05) { sd_deselect(); return 2; }
+	if ((r & 0x1F) != 0x05) { sd_deselect(); return 2; }   // 0x05 = data accepted
 
-	uint32_t wait = 0;
-	while(spi_transfer(0xFF) == 0) {
-		if (++wait > 500000) { sd_deselect(); return 3; }
+	// The card holds MISO low (reads 0x00) while it programs its flash.
+	// Usually short, sometimes 100+ ms. Spin briefly, then SLEEP 1 ms between checks
+	// instead of burning the CPU.
+	TickType_t t0 = xTaskGetTickCount();
+	uint32_t spins = 0;
+	while (spi_transfer(0xFF) == 0x00) {
+		if (++spins < 100) continue;                 // ~0.15 ms of quick checks
+		if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+			if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(500)) { sd_deselect(); return 3; }
+			vTaskDelay(1);
+		} else if (spins > 500000) { sd_deselect(); return 3; }
 	}
 
 	sd_deselect();
@@ -494,9 +604,95 @@ uint8_t mpu_read_burst(uint8_t reg, uint8_t *buf, uint8_t n) {
     I2C1->CR1 |= (1 << 10);                        // ACK back on
     return 1;
 }
+/* ^ polling version, no longer used by the tasks. Kept to compare against the DMA
+     version on the logic analyzer (PA8 high time). */
+
+/* ---------------- I2C1 RX DMA (DMA1 Stream5, Channel 1) ----------------
+   FROM = I2C1->DR (stays put), TO = buf (moves forward), HOW MANY = n.
+   I2C1 raises a DMA request every time RXNE = 1 ("a byte just landed in DR"). */
+#define I2C_DMA        DMA1_Stream5
+#define I2C_DMA_FLAGS  (DMA_HIFCR_CTCIF5 | DMA_HIFCR_CHTIF5 | DMA_HIFCR_CTEIF5 | \
+                        DMA_HIFCR_CDMEIF5 | DMA_HIFCR_CFEIF5)
+
+static TaskHandle_t     i2c_dma_waiter = NULL;
+static volatile uint8_t i2c_dma_err    = 0;
+
+void i2c1_dma_init(void) {
+  RCC->AHB1ENR |= RCC_AHB1ENR_DMA1EN;           // DMA1 clock on
+  I2C_DMA->CR &= ~DMA_SxCR_EN;
+  while (I2C_DMA->CR & DMA_SxCR_EN);
+
+  I2C_DMA->PAR = (uint32_t)&I2C1->DR;           // FROM: I2C data register (fixed)
+  I2C_DMA->CR  = (1 << 25)                      // CHSEL = 1 -> this stream listens to I2C1_RX
+               | (3 << 16)                      // PL = very high: ST errata says I2C DMA must never be kept waiting
+               | DMA_SxCR_MINC                  // memory side moves forward (PINC stays off!)
+               | DMA_SxCR_TCIE | DMA_SxCR_TEIE; // interrupt on done / error
+                                                // DIR = 00: peripheral -> memory, bytes, direct mode
+  NVIC_SetPriority(DMA1_Stream5_IRQn, 6);       // >= 5 so it may call FreeRTOS FromISR
+  NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+}
+
+void DMA1_Stream5_IRQHandler(void) {
+  BaseType_t woke = pdFALSE;
+  uint32_t isr = DMA1->HISR;
+  DMA1->HIFCR = I2C_DMA_FLAGS;
+  if (isr & DMA_HISR_TCIF5) I2C1->CR1 |= I2C_CR1_STOP;   // last byte is in: release the bus now
+  if (isr & DMA_HISR_TEIF5) i2c_dma_err = 1;
+  if (i2c_dma_waiter) vTaskNotifyGiveFromISR(i2c_dma_waiter, &woke);
+  portYIELD_FROM_ISR(woke);
+}
+
+static void i2c_dma_stop(void) {
+  I2C1->CR2   &= ~(I2C_CR2_DMAEN | I2C_CR2_LAST);
+  I2C_DMA->CR &= ~DMA_SxCR_EN;
+  while (I2C_DMA->CR & DMA_SxCR_EN);
+  i2c_dma_waiter = NULL;
+  DMA1->HIFCR = I2C_DMA_FLAGS;
+}
+
+/* Burst-read n (>= 2) registers starting at reg. Task context only.
+   The CPU sends the register address (1 byte, fast), then the DMA collects
+   all n bytes while this task sleeps. Returns 1 = ok, 0 = fail. */
+uint8_t mpu_read_burst_dma(uint8_t reg, uint8_t *buf, uint8_t n) {
+  if (n < 2) return 0;
+
+  // 1) Tell the sensor where to start reading (CPU, polling - it's 1 byte)
+  if (!i2c_start() || !i2c_addr(MPU_ADDR, 0) || !i2c_write(reg)) return i2c_fail();
+
+  // 2) Arm the copier: TO = buf, HOW MANY = n (FROM was set once in init)
+  I2C_DMA->CR &= ~DMA_SxCR_EN;
+  while (I2C_DMA->CR & DMA_SxCR_EN);
+  DMA1->HIFCR   = I2C_DMA_FLAGS;
+  I2C_DMA->M0AR = (uint32_t)buf;
+  I2C_DMA->NDTR = n;
+  i2c_dma_err   = 0;
+  ulTaskNotifyTake(pdTRUE, 0);                  // throw away any stale wake-up
+  i2c_dma_waiter = xTaskGetCurrentTaskHandle();
+  I2C_DMA->CR |= DMA_SxCR_EN;
+
+  // 3) Let I2C1 request the DMA. LAST = hardware NACKs the final byte by itself
+  //    (with polling, we had to do the BTF / ACK-off dance by hand for this).
+  I2C1->CR1 |= I2C_CR1_ACK;
+  I2C1->CR2 |= I2C_CR2_DMAEN | I2C_CR2_LAST;
+
+  // 4) Repeated START + address with read bit. Clearing ADDR (inside i2c_addr)
+  //    starts the bytes flowing - from here on it's all hardware.
+  if (!i2c_start() || !i2c_addr(MPU_ADDR, 1)) { i2c_dma_stop(); return i2c_fail(); }
+
+  // 5) Sleep until the DMA interrupt wakes us. 14 bytes at 100 kHz ~ 1.3 ms.
+  uint8_t ok = (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5)) != 0) && !i2c_dma_err;
+  i2c_dma_stop();
+  if (!ok) return i2c_fail();
+
+  // STOP was requested in the interrupt; hardware clears the bit once it's sent.
+  uint32_t t = 100000;
+  while ((I2C1->CR1 & I2C_CR1_STOP) && --t);
+  return 1;
+}
 
 /* ---------------- Task messages + queues ----------------*/
-/* imu_task --[imu_q]--> filter_task --[log_q]--> sd_task --> SD card */
+/* imu_task --[imu_q]--> filter_task --[log_q]--> sd_task --[full_q]--> sdw_task --> SD card
+                                                      ^------[free_q]------'                */
 typedef struct {
 	uint32_t ms;        // tick when sampled
 	uint8_t  raw[14];   // the burst read, untouched
@@ -519,7 +715,24 @@ static volatile uint32_t imu_faults = 0;   // failed reads (sensor unplugged / a
 static volatile uint32_t imu_q_max = 0;    // worst backlog seen in each queue
 static volatile uint32_t log_q_max = 0;
 
-static TaskHandle_t imu_h, filter_h, sd_h;   // so sd_task can ask each task how much stack it used
+/* ---------------- Ping-pong SD blocks ----------------
+   Two 512-byte blocks. sd_task (the formatter) fills one with CSV text while
+   sdw_task (the writer) DMAs the other one to the card. They never touch the
+   same block: a block index is either in free_q (empty, formatter's), in full_q
+   (waiting for the writer) or being worked on by exactly one task. Swapping
+   = passing a 1-byte index through a queue. No 512-byte copies.
+   Every write is a whole, block-aligned 512 bytes, so FatFS hands blk[i]
+   straight to disk_write -> the DMA reads directly from our buffer. */
+#define BLK 512
+static uint8_t blk[2][BLK] __attribute__((aligned(4)));
+static QueueHandle_t free_q;   // empty blocks (formatter takes from here)
+static QueueHandle_t full_q;   // full blocks  (writer takes from here)
+
+static volatile uint32_t blocks_written = 0;
+static volatile uint32_t blk_waits = 0;    // formatter had to wait for an empty block (writer too slow)
+static volatile uint32_t sd_errors = 0;    // failed f_write / f_sync
+
+static TaskHandle_t imu_h, filter_h, sd_h, sdw_h;   // so sd_task can ask each task how much stack it used
 
 void debug_pin_init(void) {
   RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
@@ -562,7 +775,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   uart2_init();
   i2c1_init();
+  i2c1_dma_init();
   spi1_init();
+  spi1_dma_init();
   debug_pin_init();
 
   delay_ms(100);              // MPU boot time
@@ -590,7 +805,8 @@ int main(void)
   }
   sendStr("file "); sendStr(name); sendStr(" open "); sendInt(r); sendStr("\r\n");
   if (r != FR_OK) { sendStr("NO LOG FILE - stopping\r\n"); while (1); }
-  f_printf(&file, "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n");   // header row
+  // (header row is now written by sd_task into the first ping-pong block,
+  //  so every write to the file stays a whole, aligned 512-byte block)
 
   /* USER CODE END 2 */
 
@@ -612,7 +828,10 @@ int main(void)
   /* USER CODE BEGIN RTOS_QUEUES */
   imu_q = xQueueCreate(16, sizeof(imu_msg_t));
   log_q = xQueueCreate(64, sizeof(log_msg_t));
-  if (!imu_q || !log_q) sendStr("queue create FAIL\r\n");
+  free_q = xQueueCreate(2, sizeof(uint8_t));
+  full_q = xQueueCreate(2, sizeof(uint8_t));
+  if (!imu_q || !log_q || !free_q || !full_q) sendStr("queue create FAIL\r\n");
+  for (uint8_t i = 0; i < 2; i++) xQueueSend(free_q, &i, 0);   // both blocks start empty
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -622,11 +841,16 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   // Stack sizes are in words (4 bytes), sized from measured high-water marks
   // (used: imu 44, filter 96, sd ~132 words) with 2.7-3.9x margin.
+  // sd was split into sd (formatter, no FatFS now) + sdw (writer, all FatFS calls):
+  // measured 10 Oct: sd used 78 words (256 = 3.3x), sdw used 119 (384 = 3.2x).
   // Priorities on CubeMX's 0-55 scale:
   // sampling must never be late, SD writing is allowed to be late (the queues absorb it).
+  // Writer is lowest: it mostly sleeps (DMA / card busy), and it must never
+  // starve the formatter that keeps log_q drained.
   if (xTaskCreate(imu_task,    "imu",    128,  NULL, osPriorityHigh,        &imu_h) != pdPASS ||  // 40
       xTaskCreate(filter_task, "filter", 256,  NULL, osPriorityAboveNormal, &filter_h) != pdPASS ||  // 32
-      xTaskCreate(sd_task,     "sd",     512,  NULL, osPriorityBelowNormal, &sd_h) != pdPASS)    // 16
+      xTaskCreate(sd_task,     "sd",     256,  NULL, osPriorityBelowNormal, &sd_h) != pdPASS ||    // 16
+      xTaskCreate(sdw_task,    "sdw",    384,  NULL, osPriorityLow,         &sdw_h) != pdPASS)     // 8
     sendStr("task create FAIL (out of heap?)\r\n");
   // heartbeat (defaultTask, created by CubeMX above) is Normal = 24
   /* USER CODE END RTOS_THREADS */
@@ -813,7 +1037,8 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 /* ---------------- Tasks ---------------- */
 
-/* imu_task: read the MPU-6050 every 10 ms (100 Hz), hand the raw bytes on. */
+/* imu_task: read the MPU-6050 every 10 ms (100 Hz), hand the raw bytes on.
+   The 14-byte read is done by DMA: this task sleeps ~1.3 ms while the bytes arrive. */
 void imu_task(void *arg) {
   (void)arg;
   uint8_t restart = 1;
@@ -824,7 +1049,7 @@ void imu_task(void *arg) {
 
     imu_msg_t m;
     GPIOA->BSRR = (1 << 8);                        // debug pin HIGH = reading
-    uint8_t ok = mpu_read_burst(ACCEL_XOUT_H, m.raw, 14) &&
+    uint8_t ok = mpu_read_burst_dma(ACCEL_XOUT_H, m.raw, 14) &&
                  (m.raw[0] | m.raw[1] | m.raw[2] | m.raw[3] | m.raw[4] | m.raw[5]) != 0;  // all-zero = asleep (Bug 17)
     GPIOA->BSRR = (1 << (8 + 16));                 // debug pin LOW
 
@@ -898,21 +1123,60 @@ void filter_task(void *arg) {
   }
 }
 
-/* sd_task: write CSV rows. Once per second of TIME (not per 100 rows, so it
-   keeps reporting even if the sensor is gone): save the file and print stats.
-   Every 10 s also print how much stack each task never touched.
-   Lowest priority: if the SD card stalls, rows just pile up in log_q. */
+/* ---- CSV formatting into the ping-pong blocks (sd_task only) ---- */
+static uint8_t  fmt_cur;    // index of the block the formatter is filling
+static uint16_t fmt_used;   // bytes already in it
+
+static char *put_u32(char *p, uint32_t u) {
+  char t[10];
+  int i = 0;
+  do { t[i++] = '0' + (u % 10); u /= 10; } while (u);
+  while (i) *p++ = t[--i];
+  return p;
+}
+
+static char *put_i16(char *p, int16_t v) {
+  if (v < 0) { *p++ = '-'; return put_u32(p, (uint32_t)(-(int32_t)v)); }
+  return put_u32(p, (uint32_t)v);
+}
+
+/* Add text to the current block. When it fills up: hand it to the writer and
+   SWAP to the other block (no copying - just pass the index along). */
+static void blk_append(const char *s, uint16_t len) {
+  while (len) {
+    uint16_t room = BLK - fmt_used;
+    uint16_t k = (len < room) ? len : room;   // a row may be split across two blocks - that's fine,
+    memcpy(&blk[fmt_cur][fmt_used], s, k);    // the file is just one long stream of bytes
+    fmt_used += k; s += k; len -= k;
+
+    if (fmt_used == BLK) {
+      xQueueSend(full_q, &fmt_cur, portMAX_DELAY);          // full -> writer (never waits: only 2 blocks exist)
+      if (xQueueReceive(free_q, &fmt_cur, 0) != pdPASS) {   // grab the other block
+        blk_waits++;                                        // writer still busy with it: wait
+        xQueueReceive(free_q, &fmt_cur, portMAX_DELAY);     // (rows pile up in log_q meanwhile)
+      }
+      fmt_used = 0;
+    }
+  }
+}
+
+/* sd_task (formatter): turn log rows into CSV text inside the ping-pong blocks.
+   Never touches FatFS or SPI - that's sdw_task's job.
+   Once per second of TIME (so it keeps reporting even if the sensor is gone): print stats.
+   Every 10 s also print how much stack each task never touched. */
 void sd_task(void *arg) {
   (void)arg;
   sendStr("tasks running\r\n");
 
-  // PA9 (Arduino D8) = HIGH while f_sync runs, for the logic analyzer
-  GPIOA->MODER &= ~(3 << 18);
-  GPIOA->MODER |=  (1 << 18);
+  xQueueReceive(free_q, &fmt_cur, portMAX_DELAY);   // first empty block
+  fmt_used = 0;
+  static const char header[] = "ms,ax,ay,az,gx,gy,gz,roll_x100,pitch_x100\n";
+  blk_append(header, sizeof(header) - 1);
 
   TickType_t next_report = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
   uint8_t reports = 0;
   log_msg_t r;
+  char line[80];   // longest row is ~75 chars
 
   for (;;) {
     // Wait for a row, but never past the next report time
@@ -922,22 +1186,25 @@ void sd_task(void *arg) {
     if (xQueueReceive(log_q, &r, (TickType_t)wait) == pdPASS) {
       uint32_t n = uxQueueMessagesWaiting(log_q) + 1;
       if (n > log_q_max) log_q_max = n;
-      f_printf(&file, "%lu, %d, %d, %d, %d, %d, %d, %d, %d\n",
-               r.ms, r.ax, r.ay, r.az, r.gx, r.gy, r.gz, r.roll_x100, r.pitch_x100);
+
+      // same format as the old f_printf: "ms, ax, ay, az, gx, gy, gz, roll, pitch\n"
+      int16_t v[8] = { r.ax, r.ay, r.az, r.gx, r.gy, r.gz, r.roll_x100, r.pitch_x100 };
+      char *p = put_u32(line, r.ms);
+      for (int i = 0; i < 8; i++) { *p++ = ','; *p++ = ' '; p = put_i16(p, v[i]); }
+      *p++ = '\n';
+      blk_append(line, (uint16_t)(p - line));
     }
 
     if ((int32_t)(xTaskGetTickCount() - next_report) >= 0) {   // 1 s passed
       next_report += pdMS_TO_TICKS(1000);
 
-      GPIOA->BSRR = (1 << 9);                      // D8 HIGH = saving
-      FRESULT fr = f_sync(&file);
-      GPIOA->BSRR = (1 << (9 + 16));               // D8 LOW
-      if (fr != FR_OK) sendStr("sync FAIL\r\n");
-
       sendStr("imuq ");  sendInt((int16_t)imu_q_max);
       sendStr(" logq "); sendInt((int16_t)log_q_max);
       sendStr(" drop "); sendInt((int16_t)imu_drops); sendStr("/"); sendInt((int16_t)log_drops);
-      sendStr(" fault "); sendInt((int16_t)imu_faults); sendStr("\r\n");
+      sendStr(" fault "); sendInt((int16_t)imu_faults);
+      sendStr(" blk ");  sendU32(blocks_written);
+      sendStr(" wait "); sendU32(blk_waits);
+      sendStr(" sderr "); sendU32(sd_errors); sendStr("\r\n");
 
       if (++reports >= 10) {                       // every 10 s
         reports = 0;
@@ -946,10 +1213,49 @@ void sd_task(void *arg) {
         sendStr("stack free (words): imu ");  sendInt((int16_t)uxTaskGetStackHighWaterMark(imu_h));
         sendStr(" filter ");                  sendInt((int16_t)uxTaskGetStackHighWaterMark(filter_h));
         sendStr(" sd ");                      sendInt((int16_t)uxTaskGetStackHighWaterMark(sd_h));
+        sendStr(" sdw ");                     sendInt((int16_t)uxTaskGetStackHighWaterMark(sdw_h));
         sendStr(" hb ");                      sendInt((int16_t)uxTaskGetStackHighWaterMark((TaskHandle_t)defaultTaskHandle));
         sendStr(" | heap min free (bytes): "); sendInt((int16_t)xPortGetMinimumEverFreeHeapSize());
         sendStr("\r\n");
       }
+    }
+  }
+}
+
+/* sdw_task (writer): the ONLY task that touches FatFS / SPI.
+   Takes a full block, writes it (FatFS -> disk_write -> SPI DMA straight from
+   blk[i]), gives the block back as empty. Saves the file once a second.
+   Lowest priority: while it sleeps on the DMA or the card's busy time,
+   the formatter keeps filling the other block. */
+void sdw_task(void *arg) {
+  (void)arg;
+
+  // PA9 (Arduino D8) = HIGH while writing a block or saving, for the logic analyzer
+  GPIOA->MODER &= ~(3 << 18);
+  GPIOA->MODER |=  (1 << 18);
+
+  TickType_t next_sync = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+  uint8_t i;
+
+  for (;;) {
+    int32_t wait = (int32_t)(next_sync - xTaskGetTickCount());
+    if (wait < 0) wait = 0;
+
+    if (xQueueReceive(full_q, &i, (TickType_t)wait) == pdPASS) {
+      UINT bw = 0;
+      GPIOA->BSRR = (1 << 9);                      // D8 HIGH = writing
+      FRESULT fr = f_write(&file, blk[i], BLK, &bw);
+      GPIOA->BSRR = (1 << (9 + 16));               // D8 LOW
+      if (fr != FR_OK || bw != BLK) sd_errors++;
+      else blocks_written++;
+      xQueueSend(free_q, &i, 0);                   // block is empty again -> formatter
+    }
+
+    if ((int32_t)(xTaskGetTickCount() - next_sync) >= 0) {   // 1 s passed
+      next_sync += pdMS_TO_TICKS(1000);
+      GPIOA->BSRR = (1 << 9);
+      if (f_sync(&file) != FR_OK) sd_errors++;     // update file size on the card
+      GPIOA->BSRR = (1 << (9 + 16));
     }
   }
 }
