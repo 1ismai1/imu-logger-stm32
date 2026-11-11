@@ -37,6 +37,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define SD_POWER_CYCLE_TEST 0   // shield bring-up: power-cycle the SD card at boot. Set to 0 when done.
 
 /* USER CODE END PD */
 
@@ -459,7 +460,7 @@ uint8_t sd_init(void)
     sd_deselect();
     if (r != 0 || !(buf[0] & 0x40)) return 4;
 
-    //Speeding up SPI to 84 MHz /32 = 2.6 MHz (limited by jumper cables. Change when your on PCB)
+    // Speeding up SPI: BR = 010 -> 84 MHz / 8 = 10.5 MHz
     SPI1->CR1 &= ~(1 << 6);
     SPI1->CR1 &= ~(7 << 3);
     SPI1->CR1 |= (2 << 3);
@@ -757,9 +758,49 @@ static volatile uint8_t gyro_cal_state = 0;   // 0 = measuring, 1 = measured, 2 
 static TaskHandle_t imu_h, filter_h, sd_h, sdw_h;   // so sd_task can ask each task how much stack it used
 
 void debug_pin_init(void) {
-  RCC->AHB1ENR |= (1 << 0);     // GPIOA clock on
+  RCC->AHB1ENR |= (1 << 0) | (1 << 1);   // GPIOA + GPIOB clocks on
   GPIOA->MODER &= ~(3 << 16);   // clear PA8's mode bits
-  GPIOA->MODER |=  (1 << 16);   // 01 = output
+  GPIOA->MODER |=  (1 << 16);   // PA8  (D7) = DBG_IMU, output
+  GPIOB->MODER &= ~((3 << (2*5)) | (3 << (2*10)));
+  GPIOB->MODER |=  ((1 << (2*5)) | (1 << (2*10)));   // PB5 (D4) = DBG_HB, PB10 (D6) = DBG_SD
+  // Shield v1: PA9/PA10 now go to the XIAO (USART1), so they are NOT debug pins any more.
+}
+
+/* ---------------- Shield v1: switched SD power + card detect ----------------
+   PC7 (D9) = SD_EN -> enable pin of the AP2112K 3.3 V regulator that powers the card.
+   A 100k resistor on the board holds it LOW, so the card is OFF until we drive it HIGH.
+   PB4 (D5) = SD_CD -> card-detect switch in the socket, 47k pull-up on the board. */
+void shield_pins_init(void) {
+  RCC->AHB1ENR |= (1 << 1) | (1 << 2);   // GPIOB + GPIOC clocks on
+  GPIOC->BSRR   = (1 << (7 + 16));       // PC7 LOW first (card off), then make it an output
+  GPIOC->MODER &= ~(3 << (2*7));
+  GPIOC->MODER |=  (1 << (2*7));         // PC7 = output
+  GPIOB->MODER &= ~(3 << (2*4));         // PB4 = input (00)
+  GPIOB->PUPDR &= ~(3 << (2*4));         // no internal pull: the board has R9
+}
+
+uint8_t sd_card_present_pin(void) {
+  return (GPIOB->IDR >> 4) & 1;          // raw level on PB4; which level = "card in" is measured in testing
+}
+
+void sd_rail_on(void) {
+  GPIOC->BSRR = (1 << 7);                // PC7 HIGH -> regulator on
+  delay_ms(20);                          // let SD_3V3 settle before talking to the card
+  // give the SPI pins back to SPI1 (AF5) and park CS high (idle)
+  GPIOA->MODER &= ~((3 << 10) | (3 << 14));
+  GPIOA->MODER |=  ((2 << 10) | (2 << 14));   // PA5 SCK, PA7 MOSI = alternate function
+  GPIOB->BSRR   = (1 << 6);                    // CS HIGH
+  GPIOB->MODER &= ~(3 << 12);
+  GPIOB->MODER |=  (1 << 12);                  // PB6 = output
+}
+
+void sd_rail_off(void) {
+  // Pins first: a HIGH output pin would leak current into the unpowered card
+  // ("back-powering") and it might never fully switch off.
+  GPIOB->BSRR   = (1 << (6 + 16));             // CS LOW
+  GPIOA->MODER &= ~((3 << 10) | (3 << 14));    // PA5, PA7 -> input (00), stop driving
+  GPIOC->BSRR   = (1 << (7 + 16));             // PC7 LOW -> regulator off
+  delay_ms(250);                               // let the rail's capacitors drain
 }
 /* USER CODE END 0 */
 
@@ -801,6 +842,21 @@ int main(void)
   spi1_init();
   spi1_dma_init();
   debug_pin_init();
+  shield_pins_init();
+
+  /* Why did we just boot? RCC->CSR keeps flags from the last reset.
+     POR/BOR = the 3.3 V supply dipped, PIN = NRST pin pulled low,
+     SOFT = software reset, IWDG/WWDG = a watchdog fired. */
+  uint32_t csr = RCC->CSR;
+  sendStr("reset cause:");
+  if (csr & RCC_CSR_BORRSTF)  sendStr(" BOR");
+  if (csr & RCC_CSR_PORRSTF)  sendStr(" POR");
+  if (csr & RCC_CSR_PINRSTF)  sendStr(" PIN");
+  if (csr & RCC_CSR_SFTRSTF)  sendStr(" SOFT");
+  if (csr & RCC_CSR_IWDGRSTF) sendStr(" IWDG");
+  if (csr & RCC_CSR_WWDGRSTF) sendStr(" WWDG");
+  sendStr("\r\n");
+  RCC->CSR |= RCC_CSR_RMVF;   // clear them so next boot shows only the new cause
 
   delay_ms(100);              // MPU boot time
   mpu_probe();                // does anything answer at 0x68?
@@ -809,10 +865,24 @@ int main(void)
   delay_ms(100);
 
 
+  sendStr("SD_CD (PB4) = "); sendInt(sd_card_present_pin()); sendStr("\r\n");
+  sd_rail_on();
   uint8_t sd_err = sd_init();
   sendStr("SD init = ");
   sendInt(sd_err);
   sendStr("\r\n");
+
+#if SD_POWER_CYCLE_TEST
+  /* Shield test: switch the card's power off and back on from firmware,
+     then prove it still initialises. No USB unplug needed. */
+  sendStr("power-cycle test: SD off\r\n");
+  sd_rail_off();
+  sendStr("SD_3V3 should read ~0 V now (3 s to measure)\r\n");
+  delay_ms(3000);
+  sd_rail_on();
+  sd_err = sd_init();
+  sendStr("after power-cycle, SD init = "); sendInt(sd_err); sendStr("\r\n");
+#endif
 
 
   FRESULT r;
@@ -1294,9 +1364,8 @@ void sd_task(void *arg) {
 void sdw_task(void *arg) {
   (void)arg;
 
-  // PA9 (Arduino D8) = HIGH while writing a block or saving, for the logic analyzer
-  GPIOA->MODER &= ~(3 << 18);
-  GPIOA->MODER |=  (1 << 18);
+  // PB10 (Arduino D6, J_DBG "DBG_SD") = HIGH while writing a block or saving, for the logic analyzer
+  // (pin set up in debug_pin_init; PA9 now belongs to the XIAO link)
 
   TickType_t next_sync = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
   uint8_t i;
@@ -1307,9 +1376,9 @@ void sdw_task(void *arg) {
 
     if (xQueueReceive(full_q, &i, (TickType_t)wait) == pdPASS) {
       UINT bw = 0;
-      GPIOA->BSRR = (1 << 9);                      // D8 HIGH = writing
+      GPIOB->BSRR = (1 << 10);                     // DBG_SD HIGH = writing
       FRESULT fr = f_write(&file, blk[i], BLK, &bw);
-      GPIOA->BSRR = (1 << (9 + 16));               // D8 LOW
+      GPIOB->BSRR = (1 << (10 + 16));              // DBG_SD LOW
       if (fr != FR_OK || bw != BLK) sd_errors++;
       else blocks_written++;
       xQueueSend(free_q, &i, 0);                   // block is empty again -> formatter
@@ -1317,9 +1386,9 @@ void sdw_task(void *arg) {
 
     if ((int32_t)(xTaskGetTickCount() - next_sync) >= 0) {   // 1 s passed
       next_sync += pdMS_TO_TICKS(1000);
-      GPIOA->BSRR = (1 << 9);
+      GPIOB->BSRR = (1 << 10);
       if (f_sync(&file) != FR_OK) sd_errors++;     // update file size on the card
-      GPIOA->BSRR = (1 << (9 + 16));
+      GPIOB->BSRR = (1 << (10 + 16));
     }
   }
 }
@@ -1336,17 +1405,17 @@ void sdw_task(void *arg) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Heartbeat task: square wave on PA10 (Arduino D2), flips every 250 ms.
-     Proves the scheduler is switching tasks. Watch it on the logic analyzer. */
-  GPIOA->MODER &= ~(3 << 20);   // PA10 mode bits cleared
-  GPIOA->MODER |=  (1 << 20);   // 01 = output
+  /* Heartbeat task: square wave on PB5 (Arduino D4, J_DBG "DBG_HB"), flips every 250 ms.
+     Proves the scheduler is switching tasks. Watch it on the logic analyzer.
+     (Was PA10. On the shield PA10 is the XIAO's TX line, so driving it would
+     make two outputs fight. Pin is set up in debug_pin_init.) */
   uint8_t on = 0;
   for(;;)
   {
     on = !on;
     // BSRR, not ODR ^= : a read-modify-write of ODR could be interrupted by
     // imu_task changing PA8, and we'd write PA8's old value back.
-    GPIOA->BSRR = on ? (1 << 10) : (1 << (10 + 16));
+    GPIOB->BSRR = on ? (1 << 5) : (1 << (5 + 16));
     vTaskDelay(pdMS_TO_TICKS(250));
   }
   /* USER CODE END 5 */
